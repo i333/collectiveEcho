@@ -8,9 +8,10 @@ import logging
 import threading
 
 import numpy as np
-import sounddevice as sd
 import soundfile as sf
 
+# sounddevice import is deferred to the play methods — PortAudio dep, see
+# modules/audio_input.py for the same pattern.
 from modules.effects import normalize_audio, to_int16
 
 logger = logging.getLogger(__name__)
@@ -68,12 +69,56 @@ def _apply_filters(data: np.ndarray, filters: list) -> np.ndarray:
 
 def _soft_limit(data: np.ndarray, threshold: float = 0.7,
                 ratio: float = 4.0) -> np.ndarray:
-    """Soft-knee limiter to prevent exciter distortion at peaks."""
+    """Soft-knee limiter — early gentle reduction above threshold."""
     out = data.copy()
     mask = np.abs(out) > threshold
     out[mask] = np.sign(out[mask]) * (
         threshold + (np.abs(out[mask]) - threshold) / ratio
     )
+    return out
+
+
+def _brickwall_limit(data: np.ndarray, sample_rate: int,
+                      ceiling: float = 0.95,
+                      attack_ms: float = 1.0,
+                      release_ms: float = 50.0) -> np.ndarray:
+    """Smoothed brickwall limiter — hard ceiling on instantaneous peaks.
+
+    Computes a frame-wise gain envelope: where the signal exceeds the ceiling,
+    we attenuate by `ceiling / peak`. Envelope is smoothed (fast attack, slow
+    release) so the gain reduction doesn't introduce clicks. Final output
+    samples are also hard-clipped to ceiling as a safety floor.
+    """
+    if len(data) == 0:
+        return data
+    out = data.astype(np.float32, copy=True)
+    if out.ndim == 2:
+        abs_x = np.max(np.abs(out), axis=1)
+    else:
+        abs_x = np.abs(out)
+
+    # Instantaneous gain reduction needed
+    gr = np.where(abs_x > ceiling, ceiling / np.maximum(abs_x, 1e-9), 1.0)
+
+    # Asymmetric envelope smoother — fast attack (gain reduction sets in
+    # quickly), slow release (gain returns gradually to avoid pumping).
+    attack_a = np.exp(-1.0 / max(1.0, attack_ms / 1000.0 * sample_rate))
+    release_a = np.exp(-1.0 / max(1.0, release_ms / 1000.0 * sample_rate))
+    env = np.empty_like(gr)
+    env[0] = gr[0]
+    for i in range(1, len(gr)):
+        if gr[i] < env[i - 1]:    # gain reduction tightening — attack
+            env[i] = attack_a * env[i - 1] + (1 - attack_a) * gr[i]
+        else:                       # releasing
+            env[i] = release_a * env[i - 1] + (1 - release_a) * gr[i]
+
+    if out.ndim == 2:
+        out *= env[:, None]
+    else:
+        out *= env
+
+    # Safety hard clip — should never engage in normal use
+    np.clip(out, -ceiling, ceiling, out=out)
     return out
 
 
@@ -87,20 +132,50 @@ class Playback:
         exciter_cfg = cfg.get("exciter", {})
         self._exciter_enabled = exciter_cfg.get("enabled", False)
         self._exciter_filters = []
-        self._limiter_threshold = exciter_cfg.get("limiter_threshold", 0.7)
+        self._limiter_threshold = exciter_cfg.get("limiter_threshold", 0.5)
+        self._limiter_ratio = exciter_cfg.get("limiter_ratio", 8.0)
         if self._exciter_enabled:
             self._exciter_filters = _build_exciter_filters(
                 self.sample_rate, exciter_cfg)
             names = [n for n, _ in self._exciter_filters]
-            logger.info("Exciter conditioning ON: %s, limiter=%.2f",
-                        names, self._limiter_threshold)
+            logger.info("Exciter conditioning ON: %s, limiter=%.2f:%.1f",
+                        names, self._limiter_threshold, self._limiter_ratio)
+
+        # Master output stage — last safety net before the DAC.
+        # `master_gain` cuts overall headroom so the exciter isn't driven
+        # close to its mechanical limit. `master_ceiling` is the absolute
+        # peak ceiling enforced by the brickwall limiter.
+        playback_cfg = cfg.get("playback", {}) or {}
+        self.master_gain = float(playback_cfg.get("master_gain", 0.55))
+        self.master_ceiling = float(playback_cfg.get("master_ceiling", 0.92))
+        self.master_limiter_enabled = bool(playback_cfg.get("master_limiter_enabled", True))
+        logger.info("Output stage: master_gain=%.2f ceiling=%.2f brickwall=%s",
+                    self.master_gain, self.master_ceiling, self.master_limiter_enabled)
 
     def _condition(self, data: np.ndarray) -> np.ndarray:
         """Apply exciter conditioning if enabled."""
         if not self._exciter_enabled:
             return data
         data = _apply_filters(data, self._exciter_filters)
-        data = _soft_limit(data, self._limiter_threshold)
+        data = _soft_limit(data, self._limiter_threshold, self._limiter_ratio)
+        return data
+
+    def _master_stage(self, data: np.ndarray, sr: int) -> np.ndarray:
+        """Final output stage: master gain → brickwall limiter.
+
+        This is the LAST thing that touches audio before the DAC. The
+        brickwall guarantees the exciter never sees |sample| > ceiling.
+        """
+        data = data * self.master_gain
+        if self.master_limiter_enabled:
+            data = _brickwall_limit(data, sr,
+                                     ceiling=self.master_ceiling,
+                                     attack_ms=1.0, release_ms=50.0)
+        # Log the actual peak hitting the DAC (helps diagnose distortion)
+        peak = float(np.max(np.abs(data))) if len(data) else 0.0
+        rms = float(np.sqrt(np.mean(data ** 2))) if len(data) else 0.0
+        logger.info("Output peak=%.3f rms=%.3f (after master×%.2f, ceil=%.2f)",
+                    peak, rms, self.master_gain, self.master_ceiling)
         return data
 
     def play_array(self, audio: np.ndarray, sample_rate: int | None = None,
@@ -119,19 +194,55 @@ class Playback:
         else:
             data = normalize_audio(audio)
 
-        # Normalize to audible level — the lav mic records very quietly
+        # Auto-boost only for very quiet raw V1 captures. V2 clips are
+        # already loudness-normalized by the enhancer (RMS≈0.10), so this
+        # mostly no-ops post-V2 — keeping it for backward compat with
+        # any older fallback clips.
         peak = np.max(np.abs(data))
         if 0 < peak < 0.1:
             gain = 0.8 / peak
             data = data * gain
             logger.info("Playback auto-normalized: peak %.4f → gain %.1fx", peak, gain)
 
-        # Exciter conditioning
+        # Exciter conditioning (filters + soft pre-limiter)
         data = self._condition(data)
+
+        # Final output stage — master gain + brickwall ceiling.
+        # This is the single source of truth for "loudness reaching the DAC".
+        data = self._master_stage(data, sr)
 
         with self._lock:
             try:
-                # Use a large blocksize to avoid ALSA underruns on RPi
+                import sounddevice as sd
+                # Probe the output device's preferred rate; resample our buffer
+                # to match if needed. The AB13X USB DAC only supports 48000;
+                # our pipeline operates at 16000.
+                native_sr = sr
+                if self.device is not None:
+                    try:
+                        info = sd.query_devices(self.device, kind="output")
+                        native_sr = int(info["default_samplerate"])
+                    except Exception:
+                        pass
+                if native_sr != sr:
+                    from scipy.signal import resample_poly
+                    from math import gcd
+                    g = gcd(native_sr, sr)
+                    up = native_sr // g
+                    down = sr // g
+                    if data.ndim == 2:
+                        data = np.column_stack([
+                            resample_poly(data[:, ch], up, down)
+                            for ch in range(data.shape[1])
+                        ]).astype(np.float32)
+                    else:
+                        data = resample_poly(data, up, down).astype(np.float32)
+                    sr = native_sr
+                    # Polyphase resampling can produce sample-level overshoot
+                    # above the brickwall ceiling. Hard-clip as a safety floor.
+                    np.clip(data, -self.master_ceiling, self.master_ceiling, out=data)
+
+                # Use a large blocksize to avoid ALSA underruns
                 sd.default.blocksize = 2048
                 sd.default.latency = "high"
                 sd.play(data, sr, device=self.device)
@@ -151,6 +262,7 @@ class Playback:
 
     def stop(self):
         try:
+            import sounddevice as sd
             sd.stop()
         except Exception:
             pass

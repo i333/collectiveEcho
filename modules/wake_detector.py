@@ -15,6 +15,8 @@ import sys
 import threading
 import time
 
+from modules.phrase_match import PhraseMatcher
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,29 +81,21 @@ class VoskDetector(BaseDetector):
     used for recording) so detection and capture are always in sync.
     """
 
-    # "too" variants must be checked FIRST (longer match wins)
-    TOO_PHRASES = [
-        "i love you too",
-        "i love u too",
-        "i love you to",
-        "i love u to",
-    ]
-    TRIGGER_PHRASES = [
-        "i love you",
-        "i love u",
-        "i love yo",
-    ]
-
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, matcher: PhraseMatcher | None = None):
         vosk_cfg = cfg.get("vosk", {})
         self.model_path = vosk_cfg.get("model_path", "models/vosk-model-small-en-us-0.15")
         self.sample_rate = cfg["audio"]["sample_rate"]
         self._cooldown_sec = vosk_cfg.get("cooldown_sec", 3.0)
+        # Confidence floor for accepting a partial-result trigger
+        self._partial_conf_min = vosk_cfg.get("partial_confidence_min", 0.75)
         self._running = False
         self._thread = None
         self._callback = None
         self._audio_input = None
         self._last_trigger = 0.0
+        # Use the orchestrator-provided matcher (config-driven buckets) when
+        # available; otherwise fall back to a default-bucket matcher.
+        self._matcher = matcher or PhraseMatcher()
 
     def start(self, on_detected: callable, audio_input=None):
         try:
@@ -167,26 +161,26 @@ class VoskDetector(BaseDetector):
 
     def _check_trigger(self, text: str, result_type: str):
         text_lower = text.lower().strip()
+        if not self._matcher.quick_contains_love(text_lower):
+            return
+        hit = self._matcher.find(text_lower)
+        if hit is None:
+            return
+        # Be stricter on partial-result triggers to avoid premature fires
+        if result_type == "partial" and hit.confidence < self._partial_conf_min:
+            return
+        self._fire_trigger(text_lower, hit.matched_span, hit.phrase_type,
+                           result_type, hit.confidence, hit.matched_via)
 
-        # Check "too" variants first (longer match wins)
-        for phrase in self.TOO_PHRASES:
-            if phrase in text_lower:
-                self._fire_trigger(text_lower, phrase, "ily_too", result_type)
-                return
-
-        for phrase in self.TRIGGER_PHRASES:
-            if phrase in text_lower:
-                self._fire_trigger(text_lower, phrase, "ily", result_type)
-                return
-
-    def _fire_trigger(self, text: str, phrase: str, phrase_type: str, result_type: str):
+    def _fire_trigger(self, text: str, phrase: str, phrase_type: str,
+                       result_type: str, confidence: float, matched_via: str):
         now = time.time()
         if now - self._last_trigger < self._cooldown_sec:
             logger.debug("Vosk trigger suppressed (cooldown): '%s'", text)
             return
         self._last_trigger = now
-        logger.info("Vosk detected '%s' [%s] in %s result: '%s'",
-                    phrase, phrase_type, result_type, text)
+        logger.info("Vosk detected '%s' [%s] in %s result (via=%s, conf=%.2f): '%s'",
+                    phrase, phrase_type, result_type, matched_via, confidence, text)
         if self._callback:
             self._callback(phrase_type)
 
@@ -299,12 +293,12 @@ class PorcupineDetector(BaseDetector):
 # Factory
 # --------------------------------------------------------------------------
 
-def create_detector(cfg: dict) -> BaseDetector:
+def create_detector(cfg: dict, matcher: PhraseMatcher | None = None) -> BaseDetector:
     backend = cfg.get("wake_detector", "simulate")
     if backend == "simulate":
         return SimulatedDetector(cfg)
     elif backend == "vosk":
-        return VoskDetector(cfg)
+        return VoskDetector(cfg, matcher=matcher)
     elif backend == "porcupine":
         return PorcupineDetector(cfg)
     else:

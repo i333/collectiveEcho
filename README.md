@@ -184,3 +184,72 @@ The code is structured to run on Jetson with minimal changes:
 - Replace `sounddevice` with ALSA/PulseAudio bindings if needed
 - GPU-accelerated effects can be added in `modules/effects.py`
 - All config is externalized — no code changes needed for hardware differences
+
+## V2 (jetson-v2-prep branch) — Quick Reference
+
+The V2 build adds emotion-aware response selection, time-of-day mood drift,
+phonetic phrase matching, adaptive end-of-utterance capture, diversity-based
+memory eviction, WLED UDP DRGB direct color, and pluggable ASR + emotion
+backends. See `DEVLOG.md` "Session: 2026-05-14" for the full change list.
+
+### Boot / first run on Jetson
+
+```bash
+sudo apt install -y libportaudio2 libsndfile1     # PortAudio for sounddevice
+python3 -m pip install --user -r requirements.txt # if you don't have a venv yet
+python3 main.py --test                            # press Enter to fake a detection
+```
+
+### Switching to GPU ML backends (after the bigger SD card is in)
+
+```bash
+pip install --user faster-whisper                            # ~200MB + 250MB model
+pip install --user torch torchaudio transformers             # ~3GB + 1.3GB SER model
+```
+
+then in `config.yaml`:
+
+```yaml
+asr:
+  backend: whisper        # collapses Vosk's 5-6s verification to ~200-300ms
+
+emotion:
+  backend: wav2vec_ser    # real SER instead of prosody proxies
+  device: cuda
+```
+
+No other code changes. Restart `main.py`.
+
+### Turning on WLED UDP DRGB
+
+In `config.yaml`:
+
+```yaml
+wled:
+  realtime:
+    enabled: true
+    host: "192.168.0.11"    # WLED controller IP (no scheme)
+    port: 21324             # WLED listens on 21324 by default
+    num_leds: 60            # set to your actual strip length
+```
+
+Or pass `--udp-wled` to `main.py` to force-enable. The HTTP preset path
+(`wled.idle()`, `wled.layered()`, etc.) keeps working — UDP is additive,
+used for per-LED color driven by `(valence, arousal)` and the audio envelope.
+
+### Emotion-aware response selection
+
+`config.yaml → emotion.selection_mode`:
+
+| Mode       | Behavior |
+|------------|----------|
+| `match`    | Layered echo picks memories with the *closest* emotion to what the speaker just said. |
+| `contrast` | Picks the *farthest* emotion — counter-emotional response. |
+| `diverse`  | Spreads picks across the emotional space — most varied chorus. |
+
+### Time-of-day mood
+
+`modules/mood.py` modulates layer pacing, intimacy (which scales layer count
+and reverb), and WLED palette bias across the day. Persisted across restarts
+in `mood_state.json` (lifetime trigger count). No config knobs required —
+just runs.
