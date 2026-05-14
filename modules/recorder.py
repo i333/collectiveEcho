@@ -15,12 +15,15 @@ logger = logging.getLogger(__name__)
 
 
 class Recorder:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, memory_store=None):
         self.sample_rate = cfg["audio"]["sample_rate"]
         self.live_dir = cfg["memory"]["live_dir"]
         self.live_dir_too = cfg["memory"].get("live_dir_too", "audio/live/i_love_you_too")
         os.makedirs(self.live_dir, exist_ok=True)
         os.makedirs(self.live_dir_too, exist_ok=True)
+        # Optional: MemoryStore knows per-bucket directories. If supplied, we
+        # route saves through it; otherwise we fall back to the legacy paths.
+        self._memory = memory_store
 
     def capture_clip(self, audio_input) -> tuple[np.ndarray, str]:
         """
@@ -66,10 +69,18 @@ class Recorder:
             logger.warning("No audio captured")
             clip = np.array([], dtype=np.int16)
 
-        # Save to the appropriate directory
-        save_dir = self.live_dir_too if phrase_type == "ily_too" else self.live_dir
+        # Resolve save directory — prefer memory store's per-bucket map so
+        # arbitrary phrase buckets (e.g. ily_sandy) write to their own folder.
+        if self._memory is not None and hasattr(self._memory, "bucket_live_dir"):
+            save_dir = self._memory.bucket_live_dir(phrase_type)
+        elif phrase_type == "ily_too":
+            save_dir = self.live_dir_too
+        else:
+            save_dir = self.live_dir
+        os.makedirs(save_dir, exist_ok=True)
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        prefix = "ily_too" if phrase_type == "ily_too" else "ily"
+        prefix = phrase_type or "ily"
         filename = f"{prefix}_{ts}.wav"
         filepath = os.path.join(save_dir, filename)
         if len(clip) > 0:

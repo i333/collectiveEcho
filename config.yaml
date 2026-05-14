@@ -1,11 +1,9 @@
-# I Love You Mirror — Configuration
-# -----------------------------------
+# I Love You Mirror — Configuration (V2 / jetson-v2-prep)
+# ---------------------------------------------------------
 
 # Operating mode: "live", "fallback", "hybrid"
-#   live     — only use live recordings
-#   fallback — only use prerecorded fallback clips
-#   hybrid   — prefer live, fall back to prerecorded if needed
 mode: hybrid
+response_mode: layered   # "layered" or "single"
 
 # Wake-word detection backend: "simulate", "vosk", "porcupine"
 wake_detector: vosk
@@ -15,37 +13,35 @@ audio:
   sample_rate: 16000
   channels: 1
   format: int16
-  # Rolling buffer keeps this many seconds before detection
-  # Vosk has ~0.5-1s processing delay, so keep extra pre-buffer
   pre_detection_buffer_sec: 4.0
-  # Continue recording this many seconds after detection
-  post_detection_sec: 2.0
-  # Device index — null means system default
-  input_device: null
-  output_device: null
+  post_detection_sec: 2.0     # legacy fixed-duration fallback
+  # PortAudio device indices (probed 2026-05-14):
+  #   25 = USB Lavalier Microphone (DCMT, native 44100Hz, in×1)
+  #   24 = AB13X USB Audio (amp, native 48000Hz, out×2)
+  # AudioInput / Playback auto-detect each device's native rate and resample
+  # to/from the pipeline rate (16000Hz). Set null to use system default.
+  input_device: 25
+  output_device: 24
+  # Adaptive capture — keep recording until end-of-utterance silence
+  adaptive_capture:
+    enabled: true
+    min_post_sec: 1.0         # always capture at least this much
+    max_post_sec: 5.0         # hard ceiling regardless of speech
+    eos_silence_rms: 0.005    # below this counts as silence
+    eos_silence_sec: 0.7      # trailing silence required to stop
 
 # Volume / quality thresholds
-# Run calibrate.py to find good values for your space
 thresholds:
-  # RMS below this = intimate / whisper
   intimate_rms: 0.005
-  # RMS above this = strong / projected
   strong_rms: 0.02
-  # Noise floor — clips with RMS below this are silence / unusable
-  # Set very low for quiet lav mics
   noise_floor_rms: 0.0005
-  # Clipping ratio above this = distorted
   max_clipping_ratio: 0.05
-  # Minimum duration (seconds) to accept a clip
   min_duration_sec: 0.8
-  # Maximum duration (seconds)
-  max_duration_sec: 5.0
+  max_duration_sec: 6.5       # was 5.0 — DEVLOG #4 noted clips were 6.05s with adaptive capture this can shrink again
 
 # Quality gate
 quality:
-  # Minimum quality score (0-1) to persist a clip into memory
   save_threshold: 0.4
-  # Below this score the clip is unusable — use fallback
   unusable_threshold: 0.15
 
 # Memory store
@@ -56,33 +52,136 @@ memory:
   fallback_dir: audio/fallback/i_love_you
   fallback_dir_too: audio/fallback/i_love_you_too
   state_file: state.json
+  # Eviction: "diversity" (keeps rare emotion vectors) or "fifo"
+  eviction_policy: diversity
+  evict_weight_score: 0.45
+  evict_weight_similarity: 0.35
+  evict_weight_age: 0.20
+
+# Keyword buckets — what phrases trigger what responses.
+# Buckets are checked HIGHEST priority first; the first hit wins, so more
+# specific phrases (e.g. "I love you Sandy") must outrank shorter ones.
+#
+# Each bucket:
+#   id:                       short stable id; also used as filename prefix
+#   patterns:                 literal phrase variants (lowercase)
+#   slang:                    single-token slang forms (matched as whole words)
+#   priority:                 higher = checked first
+#   anchor_extra:             extra word(s) that MUST appear (in addition to
+#                             the universal love-word anchor) — e.g. "sandy"
+#                             so "I love you Sandy" matches but "I love you"
+#                             alone does not match this bucket.
+#   live_dir / fallback_dir:  where user/fallback recordings live (auto-created)
+#   save_user_recordings:     if false, never persist user recordings here
+#                             (used for memorial / specific-voice buckets)
+#   response_files_only:      if true, response is single random fallback from
+#                             this bucket — never layers user recordings in.
+phrases:
+  buckets:
+    # "I love you Sandy" — highest priority, anchored by the word "sandy".
+    # Responses come ONLY from this bucket's fallback dir; user recordings
+    # of this phrase are NOT saved (no random voices polluting Sandy's pool).
+    - id: ily_sandy
+      priority: 30
+      patterns:
+        - "i love you sandy"
+        - "i love u sandy"
+        - "i love ya sandy"
+      anchor_extra: [sandy]
+      live_dir: audio/live/i_love_you_sandy
+      fallback_dir: audio/fallback/i_love_you_sandy
+      save_user_recordings: false
+      response_files_only: true
+
+    # "I love you too" — checked before plain "ily" so it doesn't get swallowed.
+    - id: ily_too
+      priority: 20
+      patterns:
+        - "i love you too"
+        - "i love u too"
+        - "i love you to"
+        - "i love u to"
+        - "i love ya too"
+        - "i love yew too"
+      live_dir: audio/live/i_love_you_too
+      fallback_dir: audio/fallback/i_love_you_too
+
+    # Default "I love you" bucket — lowest priority, catches everything else.
+    - id: ily
+      priority: 10
+      patterns:
+        - "i love you"
+        - "i love u"
+        - "i love ya"
+        - "i love yew"
+        - "i loved you"
+        - "i loved u"
+        - "love you"
+        - "love u"
+      slang: [ily, iloveyou, iluvu]
+      live_dir: audio/live/i_love_you
+      fallback_dir: audio/fallback/i_love_you
+
+# ASR backend — "vosk" now, "whisper" once faster-whisper is installed
+asr:
+  backend: vosk
+
+# Whisper config (used when asr.backend = whisper)
+whisper:
+  model_size: distil-small.en
+  device: cuda
+  compute_type: int8_float16
+  language: en
+  beam_size: 1
+  vad_filter: true
+
+# Emotion backend — "prosody" (CPU, no deps) or "wav2vec_ser" (Jetson GPU)
+emotion:
+  backend: prosody
+  # Calibration for prosody backend
+  pitch_low_hz: 110.0
+  pitch_high_hz: 280.0
+  energy_low: 0.005
+  energy_high: 0.10
+  smoothing: 0.0
+  # Response selection: "match" (echo speaker), "contrast", "diverse"
+  selection_mode: match
+  # For wav2vec_ser backend:
+  model: audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim
+  device: cuda
 
 # Playback / effects
 playback:
-  # Layered response: max clips to layer
+  # === Master output stage (last thing before the DAC) ===
+  # `master_gain` is the single most important knob for taming exciter
+  # distortion. Each step from 1.0 downward gives the exciter more headroom.
+  #   1.0  full output (V1 behaviour — can over-drive)
+  #   0.7  ~3dB headroom
+  #   0.55 ~5dB headroom (default — safe for most surface exciters)
+  #   0.4  ~8dB headroom (very quiet, if your room is small)
+  master_gain: 0.7
+  # Absolute peak ceiling enforced by the brickwall limiter. Tightened to
+  # 0.32 to match this exciter's physical clean-output ceiling (probed
+  # 2026-05-14: distortion sets in just above peak ≈0.32 with this surface).
+  # The brickwall holds peaks below this while the body of the signal
+  # keeps the master_gain=0.7 perceived loudness.
+  master_ceiling: 0.25
+  master_limiter_enabled: true
+
   max_layers: 8
-  # Base delay between layers (seconds) — scaled by golden ratio per layer
   layer_delay_sec: 0.35
-  # Volume decay per layer (multiplier, newest=1.0)
-  # Steeper decay — volume indicates age/distance
   layer_volume_decay: 0.65
-  # Pitch detuning per layer (cents, alternating +/-)
   detune_cents: 7.0
-  # Low-pass rolloff: oldest layer cutoff (Hz) — simulates distance
   lp_oldest_hz: 3500
-  # Low-pass rolloff: newest layer cutoff (Hz) — stays bright
   lp_newest_hz: 8000
-  # Transient softening on older layers (ms fade on attack)
   transient_soften_ms: 20
-  # Fade in/out duration (seconds)
   fade_in_sec: 0.1
   fade_out_sec: 0.3
-  # Shared reverb on the final mix (not per-layer)
   reverb_enabled: true
   reverb_decay: 0.3
   reverb_delay_ms: 60
 
-# WLED
+# WLED — HTTP path (presets)
 wled:
   host: "http://192.168.0.11"
   timeout_sec: 2
@@ -97,34 +196,70 @@ wled:
     bri_min: 20
     bri_max: 255
     update_hz: 12
+  # WLED realtime UDP (DRGB) — direct per-LED color, 60+ Hz
+  realtime:
+    enabled: false              # set true (or pass --udp-wled) to activate
+    host: "192.168.0.11"        # WLED controller IP — no scheme
+    port: 21324                 # DRGB UDP port
+    num_leds: 210               # set to your strip length (probed from WLED-Gledopto on 2026-05-14)
+    hold_timeout_s: 2
+    # Frame rate for the reactive loop. WLED-Gledopto + 210 LEDs paints at
+    # ~44 fps max regardless of input rate (probed 2026-05-14). 30 matches
+    # comfortably and saves CPU + UDP traffic.
+    update_hz: 30
 
-# Vosk (used when wake_detector: vosk)
+# Vosk
 vosk:
   model_path: "models/vosk-model-small-en-us-0.15"
   cooldown_sec: 3.0
+  partial_confidence_min: 0.75  # required confidence to fire from a partial result
 
-# Porcupine (used when wake_detector: porcupine)
+# Porcupine
 porcupine:
   access_key: ""
   keyword_path: ""
   model_path: ""
   sensitivity: 0.5
 
+# Clip enhancement — applied on save so playback is consistent across
+# wildly different capture conditions (whispered, shouted, far/near).
+# This runs ONCE per accepted clip during _stage_trim_and_resave, NOT
+# during playback (the exciter chain below handles playback-time EQ).
+enhancement:
+  enabled: true
+  # High-pass cutoff — removes rumble. 60Hz preserves vocal warmth.
+  highpass_hz: 60
+  # AC-mains hum notch — set 60 in US, 50 in EU, 0 to disable.
+  hum_hz: 60
+  hum_q: 30
+  # Denoise: 0 = off, 1.0 = standard, up to 2.0 for noisy rooms.
+  # Aggressive values produce "musical noise" artifacts; bump cautiously.
+  denoise_strength: 1.0
+  # Target RMS for loudness normalization (0.10 = ~-20 dBFS).
+  # Layered clips balance because they're all hitting this level.
+  target_rms: 0.10
+  # Max gain applied during normalization. Caps lift on very quiet clips
+  # so we don't amplify noise.
+  max_gain_db: 18.0
+  # Soft-knee compressor — tames peaks without flattening dynamics.
+  comp_threshold: 0.5
+  comp_ratio: 2.5
+  # Light de-esser at the sibilance band.
+  deess_freq_hz: 6500
+  deess_threshold: 0.4
+
 # Exciter / transducer conditioning
-# Enable to clean up audio output through surface transducers
 exciter:
   enabled: true
-  # High-pass: cut bass the exciter can't reproduce (Hz)
   highpass_hz: 180
-  # Notch filter at resonant frequencies of the surface (Hz)
-  # Sweep a sine tone and listen for ringing to find your values
   notch_hz: [1200]
-  # Notch Q factor (higher = narrower notch)
   notch_q: 10
-  # Low-pass to tame harsh highs (Hz)
   lowpass_hz: 7000
-  # Soft limiter threshold (0-1) — prevents exciter distortion at peaks
-  limiter_threshold: 0.7
+  # Pre-limiter (BEFORE the master brickwall). Lower threshold + higher
+  # ratio = peaks squashed early, body of signal less affected. The master
+  # brickwall in playback.* is the absolute ceiling.
+  limiter_threshold: 0.5
+  limiter_ratio: 8.0
 
 # Logging
 logging:

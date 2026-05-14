@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Virtualenvs
+venv/
+.venv/
+env/
+
+# Runtime artifacts
+logs/*.log
+*.log
+
+# Runtime state — regenerates / decays per machine
+state.json
+mood_state.json
+
+# Audio archives — too large + machine-specific. Fallback recordings
+# (e.g. Sandy's voice) should be downloaded out-of-band or re-recorded.
+audio/live/
+audio/fallback/
+
+# Vosk model — download separately on each machine:
+#   wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+#   unzip and place at models/vosk-model-small-en-us-0.15/
+models/
