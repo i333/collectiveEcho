@@ -1,0 +1,76 @@
+{
+  "clips": [
+    {
+      "path": "audio/live/i_love_you/ily_20260513_045908_745368.wav",
+      "timestamp": "2026-05-13T04:59:05.387251",
+      "rms": 0.08022094517946243,
+      "score": 0.9,
+      "duration_sec": 6.048,
+      "is_intimate": false,
+      "phrase_type": "ily"
+    },
+    {
+      "path": "audio/live/i_love_you/ily_20260513_050044_373907.wav",
+      "timestamp": "2026-05-13T05:00:40.808240",
+      "rms": 0.035876836627721786,
+      "score": 0.9,
+      "duration_sec": 6.048,
+      "is_intimate": false,
+      "phrase_type": "ily"
+    },
+    {
+      "path": "audio/live/i_love_you/ily_20260513_050415_670990.wav",
+      "timestamp": "2026-05-13T05:04:10.465278",
+      "rms": 0.04662434384226799,
+      "score": 0.9,
+      "duration_sec": 6.048,
+      "is_intimate": false,
+      "phrase_type": "ily"
+    },
+    {
+      "path": "audio/live/i_love_you/ily_20260513_050958_653358.wav",
+      "timestamp": "2026-05-13T05:09:52.246618",
+      "rms": 0.035783760249614716,
+      "score": 0.9,
+      "duration_sec": 6.048,
+      "is_intimate": false,
+      "phrase_type": "ily"
+    },
+    {
+      "path": "audio/live/i_love_you/ily_20260513_051124_649319.wav",
+      "timestamp": "2026-05-13T05:11:11.486991",
+      "rms": 0.04015463963150978,
+      "score": 0.9,
+      "duration_sec": 6.048,
+      "is_intimate": false,
+      "phrase_type": "ily"
+    },
+    {
+      "path": "audio/live/i_love_you/ily_20260513_051355_990121.wav",
+      "timestamp": "2026-05-13T05:13:45.995868",
+      "rms": 0.05602286383509636,
+      "score": 0.9,
+      "duration_sec": 6.048,
+      "is_intimate": false,
+      "phrase_type": "ily"
+    },
+    {
+      "path": "audio/live/i_love_you/ily_20260513_051417_817504.wav",
+      "timestamp": "2026-05-13T05:14:07.935707",
+      "rms": 0.02775447629392147,
+      "score": 0.8,
+      "duration_sec": 6.048,
+      "is_intimate": false,
+      "phrase_type": "ily"
+    },
+    {
+      "path": "audio/live/i_love_you/ily_20260513_051451_627463.wav",
+      "timestamp": "2026-05-13T05:14:41.680580",
+      "rms": 0.03943062573671341,
+      "score": 0.9,
+      "duration_sec": 6.048,
+      "is_intimate": false,
+      "phrase_type": "ily"
+    }
+  ]
+}
