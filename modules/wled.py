@@ -88,6 +88,28 @@ class WLEDController:
     def fade_out(self):
         self._send(self.presets.get("fade_out", 6))
 
+    # --- fault indication --------------------------------------------------
+
+    def mic_alarm(self):
+        """Solid orange: the microphone is not being heard.
+
+        lor=2 overrides realtime/preset output so the reactive layer cannot
+        paint over the alarm (same override armor-save.sh uses for red).
+        """
+        self._set_state({
+            "on": True,
+            "bri": 160,
+            "tt": 0,
+            "lor": 2,
+            "seg": [{"id": 0, "fx": 0,
+                     "col": [[255, 90, 0], [0, 0, 0], [0, 0, 0]]}],
+        })
+
+    def clear_mic_alarm(self):
+        """Release the override and return to the idle preset."""
+        self._set_state({"lor": 0})
+        self.idle()
+
     # --- detection flash ---------------------------------------------------
 
     def flash(self):

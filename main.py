@@ -176,15 +176,25 @@ class Mirror:
             self.test_mode,
         )
 
-        try:
-            self.audio_input.start()
-        except Exception as e:
-            self.logger.warning("Could not start audio input: %s", e)
-            self.logger.info("Continuing without live mic — playback/WLED still work")
+        mic_ok = self._start_audio_input()
 
-        self.wled.idle()
         if self.wled_rt is not None:
             self.wled_rt.off()
+
+        if mic_ok:
+            # Always release a stale realtime override: a previous run may have
+            # left lor=2 from the mic alarm, which would silently block the
+            # reactive UDP layer for this whole session.
+            self.wled.clear_mic_alarm()
+        else:
+            # Deaf: nothing can ever trigger, and the service still reports
+            # "active". Make the failure visible instead of silent.
+            self.logger.error(
+                "Microphone unavailable after retries — WLED set to ORANGE; "
+                "polling in the background for recovery"
+            )
+            self.wled.mic_alarm()
+            threading.Thread(target=self._mic_recovery_loop, daemon=True).start()
 
         self.detector.start(on_detected=self._on_detection, audio_input=self.audio_input)
 
@@ -196,6 +206,46 @@ class Mirror:
             self.logger.info("Interrupted")
         finally:
             self.stop()
+
+    def _start_audio_input(self, attempts: int = 5, delay_sec: float = 2.0) -> bool:
+        """Open the mic, retrying a few times before giving up.
+
+        `systemctl restart` can race the previous process still holding the USB
+        device (PortAudio reports "Invalid number of channels"). That used to
+        leave the mirror running permanently deaf while looking healthy.
+        """
+        for i in range(1, attempts + 1):
+            try:
+                self.audio_input.start()
+                if i > 1:
+                    self.logger.info("Audio input opened on attempt %d", i)
+                return True
+            except Exception as e:
+                self.logger.warning(
+                    "Could not start audio input (attempt %d/%d): %s",
+                    i, attempts, e,
+                )
+                if i < attempts:
+                    time.sleep(delay_sec)
+        return False
+
+    def _mic_recovery_loop(self, interval_sec: float = 30.0):
+        """Poll for the mic; exit once it is back so systemd restarts cleanly.
+
+        Restarting is safer than hot-attaching the stream here — the detector
+        has already been handed this AudioInput instance.
+        """
+        while self._running:
+            time.sleep(interval_sec)
+            try:
+                self.audio_input.start()
+            except Exception:
+                continue
+            self.logger.error(
+                "Microphone is available again — exiting so systemd restarts "
+                "the service with a live audio path"
+            )
+            os._exit(1)
 
     def stop(self):
         self._running = False

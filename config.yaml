@@ -317,7 +317,7 @@ playback:
   # 0.65 → 0.78: with 12 layers, 0.65^11 ≈ 0.009 (oldest inaudible). 0.78^11
   # ≈ 0.07 — older voices stay perceivable in the chorus while newest still
   # leads. Drop back to 0.65-0.70 if the mix becomes muddy.
-  layer_volume_decay: 0.72
+  layer_volume_decay: 0.90
   # Per-clip loudness normalization at layering time. The clip enhancer
   # targets RMS 0.10 at save, but the actual on-disk RMS still varies
   # (0.04–0.14 across the pool). Re-normalising here ensures the
@@ -334,7 +334,7 @@ playback:
   # limiter is working too hard. 0 disables mix normalization entirely.
   layer_mix_target_rms: 0.12
   detune_cents: 7.0
-  lp_oldest_hz: 3500
+  lp_oldest_hz: 5500
   lp_newest_hz: 8000
   transient_soften_ms: 20
   fade_in_sec: 0.1
@@ -350,7 +350,7 @@ playback:
   # and layer_volume_decay. Set false to revert to the flat shared reverb.
   reverb_per_layer: true
   reverb_wet_newest: 0.12       # wet send gain for the newest (front) voice
-  reverb_wet_oldest: 0.45       # wet send gain for the oldest (deepest) voice
+  reverb_wet_oldest: 0.30       # wet send gain for the oldest (deepest) voice
   reverb_predelay_newest_ms: 50 # reflections lag the front voice by this much
   reverb_predelay_oldest_ms: 10 # deepest voice: reverb arrives almost with it
 
