@@ -66,6 +66,12 @@ class WLEDRealtime:
         self._react_stop = threading.Event()
         self._react_thread: threading.Thread | None = None
 
+        # Sleep-indicator loop state — deliberately separate from the
+        # reactive loop so stop_reacting() (fired by the signal-ready
+        # transition after every command) can't kill the asleep breathing.
+        self._sleep_stop = threading.Event()
+        self._sleep_thread: threading.Thread | None = None
+
         logger.info("WLEDRealtime → %s:%d, %d LEDs", self.host, self.port, self.num_leds)
 
     # --- low-level frame send --------------------------------------------
@@ -137,35 +143,88 @@ class WLEDRealtime:
         Map a (valence, arousal) emotion point to a colored, modulated field.
 
         valence: -1.0 (negative/sad) → +1.0 (positive/happy)
-                 maps hue: blue/violet → amber/warm
+                 hue path travels the WARM side of the wheel
+                 (blue 240° → purple → red 360°/0° → amber 35°),
+                 NOT through green — neutral V=0 lands at magenta-ish,
+                 not green.
         arousal: 0.0 (calm) → 1.0 (excited)
-                 maps saturation + spatial variation
+                 governs saturation (calm=desaturated/near-white, excited=vivid),
+                 spatial jitter amplitude, temporal flow speed, and sparkle
+                 density. The visible difference between calm and excited at
+                 the same hue is dramatic.
         brightness: 0.0 → 1.0  global brightness multiplier
 
-        The field is *not* uniform — even at the same emotion point, LEDs
-        vary slightly along the strip so it doesn't look like a flashlight.
+        Time-driven: each call advances a phase so the spatial wave drifts
+        along the strip — slow drift when calm, faster when excited. Holding
+        the same (V, A) for several seconds doesn't show a static pattern.
         """
         valence = max(-1.0, min(1.0, float(valence)))
         arousal = max(0.0, min(1.0, float(arousal)))
         brightness = max(0.0, min(1.0, float(brightness)))
 
-        # Hue: blue (240°) at valence=-1, amber (35°) at valence=+1
-        hue_neg = 240.0 / 360.0
-        hue_pos = 35.0 / 360.0
-        base_hue = hue_neg + (hue_pos - hue_neg) * ((valence + 1.0) * 0.5)
-
-        # Per-LED hue jitter scales with arousal (calm = unified, excited = scattered)
         n = self.num_leds
-        hue_jitter = (np.sin(np.linspace(0, 2 * math.pi, n)) * 0.04 * arousal)
-        hue = (base_hue + hue_jitter) % 1.0
 
-        # Saturation rises with both valence extremity and arousal
-        sat = 0.55 + 0.45 * (abs(valence) * 0.5 + arousal * 0.5)
-        sat = np.full(n, min(1.0, sat), dtype=np.float32)
+        # --- Hue: warm-side path -----------------------------------------
+        # Blue (240°) → purple (300°) → red (360°/0°) → amber (35°). Going
+        # through 1.0 (modulo) keeps interpolation linear without crossing
+        # green. At valence=0 we land near 317° (magenta/pink), which feels
+        # neutral-but-warm rather than the old "neutral=green" surprise.
+        hue_neg = 240.0 / 360.0          # blue
+        hue_pos = (360.0 + 35.0) / 360.0  # amber, expressed past 1.0 so
+                                          # interp goes through 1.0/0.0
+        t_v = (valence + 1.0) * 0.5      # 0..1
+        base_hue = (hue_neg + (hue_pos - hue_neg) * t_v) % 1.0
 
-        # Per-LED brightness with a slow ripple driven by arousal
-        ripple = 0.85 + 0.15 * np.sin(np.linspace(0, 3 * math.pi, n)) * arousal
+        # --- Temporal flow ------------------------------------------------
+        # Phase advances at flow_speed cycles/sec. SMOOTH range: ~50s for one
+        # strip-length when calm, ~5.5s when excited. Earlier 0.05..0.45 felt
+        # jittery — this is much more meditative.
+        now = time.monotonic()
+        flow_speed = 0.02 + 0.16 * arousal
+        phase = (now * flow_speed) * 2.0 * math.pi
+
+        # --- Per-LED hue spread — wide enough at high arousal to read as
+        # "rainbow" along the strip, tight at low arousal so it's a single
+        # mood color. 0.04 (calm, ~14° spread) → 0.45 (excited, ~160° = nearly
+        # half the wheel = strong rainbow band that flows along the strip).
+        jitter_amp = 0.04 + 0.45 * arousal
+        hue_wave = np.sin(np.linspace(0.0, 2.0 * math.pi, n) + phase) * jitter_amp
+        hue = (base_hue + hue_wave) % 1.0
+
+        # --- Saturation: low at calm/neutral, high at excited or extreme V
+        # (0,0) → 0.20 (near-white, soft);  (1,0) → 0.50 (warm but soft);
+        # (0,1) → 0.70 (vivid);              (1,1) → 1.00 (maxed).
+        sat_value = min(1.0, 0.20 + 0.30 * abs(valence) + 0.50 * arousal)
+        sat = np.full(n, sat_value, dtype=np.float32)
+
+        # --- Brightness ripple — much gentler than before, ALWAYS floored
+        # so the strip never goes fully dark. ripple_amp now 0.05..0.15 (was
+        # 0.10..0.35), and val is clamped to a min visible level after the
+        # brightness multiplier so dips in the audio envelope can't blank
+        # individual LEDs to 0.
+        ripple_amp = 0.05 + 0.10 * arousal
+        ripple = (1.0 - ripple_amp) + ripple_amp * np.sin(
+            np.linspace(0.0, 3.0 * math.pi, n) + phase * 1.7)
         val = brightness * ripple
+        # Visible-floor: brightness=0.08 minimum from the reactive loop, so a
+        # 0.10 floor here keeps every LED at least faintly lit even at the
+        # quietest audio moment. Set on the array so sparkle additions still
+        # land on top.
+        np.maximum(val, 0.10, out=val)
+
+        # --- Sparkle: scattered bright pulses, but MUCH gentler than before.
+        # Threshold raised 0.4→0.65 so only genuinely high-arousal triggers
+        # spark. Density halved (0.05→0.025), reseed slowed (5Hz→2.5Hz) so
+        # sparkles linger ~400ms instead of 200ms — reads as breathing rather
+        # than churning. Brighter delta also reduced (0.45→0.25).
+        if arousal > 0.65:
+            sparkle_density = 0.025 * (arousal - 0.65) / 0.35   # 0..0.025
+            n_sparkles = max(1, int(n * sparkle_density))
+            seed = int(now * 2.5)                                # 2.5 changes/sec
+            rng = np.random.RandomState(seed)
+            sparkle_idx = rng.choice(n, size=min(n_sparkles, n), replace=False)
+            val[sparkle_idx] = np.minimum(1.0, val[sparkle_idx] + 0.25)
+            sat[sparkle_idx] = sat[sparkle_idx] * 0.6
 
         frame = _hsv_to_rgb_array(hue, sat, val)
         self.send(frame)
@@ -174,11 +233,20 @@ class WLEDRealtime:
 
     def react_to_audio(self, audio: np.ndarray, sr: int,
                        valence: float = 0.0, arousal: float = 0.5,
+                       palette: str = "emotion",
                        update_hz: float = 60.0,
                        min_brightness: float = 0.08,
                        max_brightness: float = 1.0):
         """Start a thread that emits frames at update_hz, brightness following
-        the audio envelope, color set by (valence, arousal).
+        the audio envelope.
+
+        palette:
+          "emotion"  — emotion_field driven by (valence, arousal). Used for
+                       intimate / single-clip playback so the strip "feels
+                       like" the speaker.
+          "rainbow"  — full-spectrum hue band that drifts along the strip,
+                       brightness follows audio. Used for layered chorus
+                       playback (matches the WLED preset 4 vibe).
 
         Call stop_reacting() when playback ends.
         """
@@ -186,8 +254,9 @@ class WLEDRealtime:
         self._react_stop.clear()
 
         env = _compute_envelope(audio, sr, update_hz)
+        target = self._react_loop_rainbow if palette == "rainbow" else self._react_loop
         self._react_thread = threading.Thread(
-            target=self._react_loop,
+            target=target,
             args=(env, update_hz, valence, arousal, min_brightness, max_brightness),
             daemon=True,
         )
@@ -198,10 +267,12 @@ class WLEDRealtime:
                     min_b: float, max_b: float):
         interval = 1.0 / update_hz
         next_t = time.monotonic()
+        last_brightness = max_b
         for level in envelope:
             if self._react_stop.is_set():
                 break
             brightness = min_b + (max_b - min_b) * float(level)
+            last_brightness = brightness
             self.emotion_field(valence, arousal, brightness)
             next_t += interval
             sleep_for = next_t - time.monotonic()
@@ -210,12 +281,125 @@ class WLEDRealtime:
             else:
                 # Falling behind — re-sync rather than spiral
                 next_t = time.monotonic()
+        # Smooth fade-down so WLED's hold_timeout doesn't freeze on a bright
+        # frame (which then snaps to whatever the next preset commands).
+        self._fade_out_emotion(valence, arousal, from_b=last_brightness)
+
+    def _react_loop_rainbow(self, envelope: np.ndarray, update_hz: float,
+                            valence: float, arousal: float,
+                            min_b: float, max_b: float):
+        """Full-spectrum rainbow band drifting along the strip — brightness
+        follows audio envelope, hue cycles continuously across all LEDs."""
+        interval = 1.0 / update_hz
+        next_t = time.monotonic()
+        n = self.num_leds
+        # Position of each LED on the hue wheel (0..1 across the strip)
+        positions = np.linspace(0.0, 1.0, n, endpoint=False, dtype=np.float32)
+        sat = np.full(n, 0.95, dtype=np.float32)
+        last_brightness = max_b
+        # Drift speed: 0.10 cycles/sec → one full rainbow rotation every 10s.
+        # Slow enough to feel meditative, fast enough to be visibly "alive".
+        drift_cps = 0.10
+        for level in envelope:
+            if self._react_stop.is_set():
+                break
+            brightness = min_b + (max_b - min_b) * float(level)
+            last_brightness = brightness
+            now = time.monotonic()
+            phase = now * drift_cps
+            hue = (positions + phase) % 1.0
+            val = np.full(n, max(brightness, 0.18), dtype=np.float32)
+            frame = _hsv_to_rgb_array(hue, sat, val)
+            self.send(frame)
+            next_t += interval
+            sleep_for = next_t - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                next_t = time.monotonic()
+        # Smooth rainbow fade-down
+        self._fade_out_rainbow(positions, sat, from_b=last_brightness)
+
+    def _fade_out_emotion(self, valence: float, arousal: float, from_b: float):
+        """Linear fade from `from_b` down to 0.10 over ~0.4s, ~12 frames."""
+        steps = 12
+        target = 0.10
+        for i in range(steps):
+            if self._react_stop.is_set():
+                break
+            t = (i + 1) / steps
+            b = from_b + (target - from_b) * t
+            self.emotion_field(valence, arousal, max(b, target))
+            time.sleep(0.035)
+
+    def _fade_out_rainbow(self, positions: np.ndarray, sat: np.ndarray,
+                           from_b: float):
+        """Same fade for the rainbow palette — keeps drift active during fade."""
+        steps = 12
+        target = 0.12
+        n = positions.shape[0]
+        drift_cps = 0.10
+        for i in range(steps):
+            if self._react_stop.is_set():
+                break
+            t = (i + 1) / steps
+            b = from_b + (target - from_b) * t
+            now = time.monotonic()
+            phase = now * drift_cps
+            hue = (positions + phase) % 1.0
+            val = np.full(n, max(b, target), dtype=np.float32)
+            frame = _hsv_to_rgb_array(hue, sat, val)
+            self.send(frame)
+            time.sleep(0.035)
 
     def stop_reacting(self):
         self._react_stop.set()
         if self._react_thread is not None and self._react_thread.is_alive():
             self._react_thread.join(timeout=0.5)
         self._react_thread = None
+
+    # --- sleep indicator --------------------------------------------------
+
+    def start_sleep_indicator(self, color: tuple[int, int, int] = (20, 40, 140),
+                              period_s: float = 6.0, update_hz: float = 8.0,
+                              min_b: float = 0.05, max_b: float = 0.30):
+        """Slow breathing pulse in a distinct color — the visible "asleep"
+        state. Streams frames continuously (low rate) so it overrides the
+        idle preset until stop_sleep_indicator() lets WLED fall back."""
+        self.stop_sleep_indicator()
+        self._sleep_stop.clear()
+        self._sleep_thread = threading.Thread(
+            target=self._sleep_loop,
+            args=(color, period_s, update_hz, min_b, max_b),
+            daemon=True,
+        )
+        self._sleep_thread.start()
+        logger.info("Sleep indicator started (color=%s, period=%.1fs)", color, period_s)
+
+    def _sleep_loop(self, color: tuple[int, int, int], period_s: float,
+                    update_hz: float, min_b: float, max_b: float):
+        interval = 1.0 / update_hz
+        base = np.array(color, dtype=np.float32)
+        start = time.monotonic()
+        while not self._sleep_stop.wait(interval):
+            t = time.monotonic() - start
+            # Cosine breath between min_b and max_b
+            b = min_b + (max_b - min_b) * 0.5 * (1.0 - math.cos(2.0 * math.pi * t / period_s))
+            frame = np.tile((base * b).astype(np.uint8), (self.num_leds, 1))
+            self.send(frame)
+        # Quick fade to black so the hold_timeout fallback to the idle
+        # preset doesn't snap from a lit frame.
+        for i in range(6, -1, -1):
+            frame = np.tile((base * min_b * (i / 6.0)).astype(np.uint8),
+                            (self.num_leds, 1))
+            self.send(frame)
+            time.sleep(0.04)
+
+    def stop_sleep_indicator(self):
+        self._sleep_stop.set()
+        if self._sleep_thread is not None and self._sleep_thread.is_alive():
+            self._sleep_thread.join(timeout=1.0)
+        self._sleep_thread = None
 
     # --- expressive one-shots --------------------------------------------
 
@@ -235,6 +419,7 @@ class WLEDRealtime:
 
     def close(self):
         self.stop_reacting()
+        self.stop_sleep_indicator()
         try:
             self._sock.close()
         except OSError:

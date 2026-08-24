@@ -15,6 +15,7 @@ import os
 import glob as globmod
 import random
 from dataclasses import dataclass, asdict, field
+from datetime import datetime
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,11 @@ class ClipEntry:
     dominance: float = 0.5               # [0, 1]
     emotion_label: str = "neutral"
     last_played_ts: float = 0.0          # epoch seconds; 0 if never
+    # Speaker identification (V2.1). Empty string means unidentified —
+    # treated as a distinct speaker in dedup so old clips behave sensibly
+    # until backfill assigns ids.
+    speaker_id: str = ""
+    speaker_embedding: list = field(default_factory=list)
 
 
 class MemoryStore:
@@ -67,6 +73,9 @@ class MemoryStore:
         self.evict_weight_age = mem.get("evict_weight_age", 0.20)
 
         self.clips: list[ClipEntry] = []
+        # Threshold the on-disk speaker_ids were clustered with. Used by
+        # backfill_speakers() to auto-recluster after a config change.
+        self.clustering_threshold: float | None = None
         os.makedirs(self.live_dir_too, exist_ok=True)
         os.makedirs(self.fallback_dir_too, exist_ok=True)
         self._load_state()
@@ -115,6 +124,9 @@ class MemoryStore:
             try:
                 with open(self.state_file, "r") as f:
                     data = json.load(f)
+                thr = data.get("clustering_threshold")
+                if isinstance(thr, (int, float)):
+                    self.clustering_threshold = float(thr)
                 for entry in data.get("clips", []):
                     if not os.path.exists(entry["path"]):
                         continue
@@ -123,13 +135,16 @@ class MemoryStore:
                     allowed = ClipEntry.__dataclass_fields__.keys()
                     safe = {k: v for k, v in entry.items() if k in allowed}
                     self.clips.append(ClipEntry(**safe))
-                logger.info("Loaded %d clips from state", len(self.clips))
+                logger.info("Loaded %d clips from state (clustering_threshold=%s)",
+                             len(self.clips), self.clustering_threshold)
             except Exception:
                 logger.exception("Failed to load state file")
                 self.clips = []
 
     def _save_state(self):
         data = {"clips": [asdict(c) for c in self.clips]}
+        if self.clustering_threshold is not None:
+            data["clustering_threshold"] = self.clustering_threshold
         try:
             with open(self.state_file, "w") as f:
                 json.dump(data, f, indent=2)
@@ -143,7 +158,9 @@ class MemoryStore:
                  phrase_type: str = "ily",
                  valence: float = 0.0, arousal: float = 0.5,
                  dominance: float = 0.5,
-                 emotion_label: str = "neutral"):
+                 emotion_label: str = "neutral",
+                 speaker_id: str = "",
+                 speaker_embedding: list | None = None):
         entry = ClipEntry(
             path=path,
             timestamp=timestamp,
@@ -156,6 +173,8 @@ class MemoryStore:
             arousal=arousal,
             dominance=dominance,
             emotion_label=emotion_label,
+            speaker_id=speaker_id,
+            speaker_embedding=list(speaker_embedding) if speaker_embedding is not None else [],
         )
         self.clips.append(entry)
 
@@ -163,9 +182,9 @@ class MemoryStore:
             self._evict_one()
 
         self._save_state()
-        logger.info("Clip added (%d/%d): %s [emo=%s V=%+.2f A=%.2f]",
+        logger.info("Clip added (%d/%d): %s [emo=%s V=%+.2f A=%.2f spk=%s]",
                      len(self.clips), self.max_clips, path,
-                     emotion_label, valence, arousal)
+                     emotion_label, valence, arousal, speaker_id or "?")
 
     # --- eviction ---------------------------------------------------------
 
@@ -267,6 +286,162 @@ class MemoryStore:
         files.sort()
         return files
 
+    def archive_live_clips(self, exclude_buckets: set[str] | None = None) -> dict:
+        """Move every saved live clip into a timestamped archive subdir under
+        its current directory, write a manifest.json alongside the moved
+        files preserving full ClipEntry metadata (score, emotion, V/A/D,
+        timestamp, etc.), and remove the entries from state.json so they
+        no longer appear in any pool/layered selection.
+
+        Files are PRESERVED on disk (moved, not deleted) so nothing is lost.
+        The companion restore_archives() reads the manifest to put clips
+        back with all metadata intact.
+
+        Returns a per-bucket count of archived clips.
+        """
+        exclude_buckets = exclude_buckets or set()
+        archive_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        counts: dict = {}
+        kept_clips: list[ClipEntry] = []
+        # manifest_groups[archive_dir] = list of (entry_dict, original_relative_path)
+        manifest_groups: dict[str, list[dict]] = {}
+        for c in self.clips:
+            if c.phrase_type in exclude_buckets:
+                kept_clips.append(c)
+                continue
+            path_full = c.path if os.path.isabs(c.path) else c.path
+            if not os.path.exists(path_full):
+                # Already missing — drop the entry quietly
+                counts[c.phrase_type] = counts.get(c.phrase_type, 0) + 1
+                continue
+            bucket_dir = os.path.dirname(path_full)
+            archive_dir = os.path.join(bucket_dir, "archive", archive_ts)
+            try:
+                os.makedirs(archive_dir, exist_ok=True)
+                new_path = os.path.join(archive_dir, os.path.basename(path_full))
+                os.rename(path_full, new_path)
+                # Stash the entry dict + ORIGINAL path so restore can put
+                # the file back to its proper bucket dir later.
+                entry_dict = asdict(c)
+                entry_dict["_original_path"] = c.path
+                manifest_groups.setdefault(archive_dir, []).append(entry_dict)
+                counts[c.phrase_type] = counts.get(c.phrase_type, 0) + 1
+            except Exception:
+                logger.exception("Archive failed for %s — keeping in state", c.path)
+                kept_clips.append(c)
+
+        # Write one manifest.json per archive subdir so restore_archives()
+        # can find and roll them back.
+        for archive_dir, entries in manifest_groups.items():
+            try:
+                with open(os.path.join(archive_dir, "manifest.json"), "w") as f:
+                    json.dump({
+                        "archived_at": archive_ts,
+                        "clips": entries,
+                    }, f, indent=2)
+            except Exception:
+                logger.exception("Failed to write manifest in %s", archive_dir)
+
+        self.clips = kept_clips
+        self._save_state()
+        logger.info("Archived live clips → archive/%s : %s",
+                     archive_ts, counts)
+        return counts
+
+    def restore_archives(self) -> dict:
+        """Walk every bucket's archive subdirs, read each manifest.json, move
+        the clips back into the bucket's live dir, and re-add the entries
+        (with original metadata: score, emotion, V/A/D, timestamp) to state.
+
+        Idempotent: a manifest with no remaining files is skipped. After
+        successful restore, the manifest.json is removed so the same archive
+        isn't re-restored next time.
+
+        On filename collisions (a freshly-captured clip already occupies the
+        original path), the restored clip is renamed with a __restoredN
+        suffix and its entry path is updated.
+
+        Returns per-bucket count of restored clips.
+        """
+        counts: dict = {}
+        restored_total = 0
+        skipped_missing = 0
+        # Find every archive subdir under every known bucket's live dir.
+        # Live dirs come from configure_buckets — fall back to the legacy
+        # ily/ily_too if no buckets registered.
+        live_dirs: set[str] = set()
+        for d in self._bucket_dirs.values():
+            live_dirs.add(d.get("live", ""))
+        live_dirs.discard("")
+
+        manifest_paths: list[str] = []
+        for live_dir in live_dirs:
+            archive_root = os.path.join(live_dir, "archive")
+            if not os.path.isdir(archive_root):
+                continue
+            for ts_dir in sorted(os.listdir(archive_root)):
+                full_ts = os.path.join(archive_root, ts_dir)
+                manifest = os.path.join(full_ts, "manifest.json")
+                if os.path.isfile(manifest):
+                    manifest_paths.append(manifest)
+
+        for manifest_path in manifest_paths:
+            try:
+                with open(manifest_path) as f:
+                    data = json.load(f)
+            except Exception:
+                logger.exception("Could not read manifest %s — skipping", manifest_path)
+                continue
+
+            archive_dir = os.path.dirname(manifest_path)
+            for entry_dict in data.get("clips", []):
+                original_path = entry_dict.pop("_original_path", None)
+                if not original_path:
+                    # Old archives without _original_path — best-effort: put
+                    # back into the bucket's live_dir using the basename.
+                    original_path = os.path.join(
+                        self.bucket_live_dir(entry_dict.get("phrase_type", "ily")),
+                        os.path.basename(entry_dict.get("path", "")),
+                    )
+                src = os.path.join(archive_dir, os.path.basename(original_path))
+                if not os.path.exists(src):
+                    skipped_missing += 1
+                    continue
+                # Handle collision at destination
+                dest = original_path
+                n = 1
+                while os.path.exists(dest):
+                    base, ext = os.path.splitext(original_path)
+                    dest = f"{base}__restored{n}{ext}"
+                    n += 1
+                try:
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    os.rename(src, dest)
+                    entry_dict["path"] = dest
+                    # Re-create ClipEntry with only known fields (forward-compat)
+                    allowed = ClipEntry.__dataclass_fields__.keys()
+                    safe = {k: v for k, v in entry_dict.items() if k in allowed}
+                    self.clips.append(ClipEntry(**safe))
+                    pt = entry_dict.get("phrase_type", "ily")
+                    counts[pt] = counts.get(pt, 0) + 1
+                    restored_total += 1
+                except Exception:
+                    logger.exception("Restore failed for %s", src)
+
+            # Manifest done — remove it AND the (now-empty) archive subdir if empty.
+            try:
+                os.remove(manifest_path)
+                # Try to remove the timestamped archive dir if empty
+                if not os.listdir(archive_dir):
+                    os.rmdir(archive_dir)
+            except Exception:
+                pass
+
+        self._save_state()
+        logger.info("Restored %d clips from %d manifests : %s (missing: %d)",
+                     restored_total, len(manifest_paths), counts, skipped_missing)
+        return counts
+
     def has_live_clips(self, phrase_type: str | None = None) -> bool:
         if phrase_type is None:
             return len(self.clips) > 0
@@ -317,6 +492,123 @@ class MemoryStore:
             chosen = random.sample(scored, k=min(n, len(scored)))
         return chosen
 
+    # --- speaker identification ------------------------------------------
+
+    def speaker_centroids(self) -> list[tuple[str, "np.ndarray"]]:
+        """Return [(speaker_id, mean_embedding)] for every speaker that has
+        at least one embedded clip. Centroids are L2-normalised so cosine
+        comparisons against a fresh embedding behave correctly."""
+        import numpy as np
+        groups: dict[str, list[list[float]]] = {}
+        for c in self.clips:
+            if not c.speaker_id or not c.speaker_embedding:
+                continue
+            groups.setdefault(c.speaker_id, []).append(c.speaker_embedding)
+        out = []
+        for sid, embs in groups.items():
+            arr = np.asarray(embs, dtype=np.float32)
+            mean = arr.mean(axis=0)
+            n = float(np.linalg.norm(mean))
+            if n > 1e-9:
+                mean = mean / n
+            out.append((sid, mean))
+        return out
+
+    def recluster_speakers(self, identifier) -> dict:
+        """Re-run online clustering on already-embedded clips, ignoring any
+        existing speaker_id assignments. Use this after retuning the
+        similarity threshold so old assignments get rebuilt without paying
+        the cost of re-embedding every clip.
+        """
+        for c in self.clips:
+            c.speaker_id = ""
+        return self.backfill_speakers(identifier)
+
+    def backfill_speakers(self, identifier) -> dict:
+        """Embed any clip lacking a speaker_embedding, cluster every clip
+        without a speaker_id, persist once at the end.
+
+        Returns a summary {clips_embedded, clips_identified, speakers_total}.
+        """
+        import numpy as np
+        import soundfile as sf
+
+        if not identifier or not getattr(identifier, "enabled", False):
+            return {"clips_embedded": 0, "clips_identified": 0, "speakers_total": 0}
+
+        # If the configured similarity threshold differs from the one the
+        # on-disk speaker_ids were clustered with, drop those assignments
+        # so the loop below re-clusters all clips at the current threshold.
+        cur_thr = float(identifier.similarity_threshold)
+        if self.clustering_threshold is not None and \
+                abs(self.clustering_threshold - cur_thr) > 1e-6:
+            logger.info("Threshold changed (%.3f → %.3f) — clearing speaker_ids for recluster",
+                         self.clustering_threshold, cur_thr)
+            for c in self.clips:
+                c.speaker_id = ""
+        self.clustering_threshold = cur_thr
+
+        # 1. Embed clips that don't have an embedding yet.
+        embedded = 0
+        for c in self.clips:
+            if c.speaker_embedding:
+                continue
+            if not os.path.exists(c.path):
+                continue
+            try:
+                audio, sr = sf.read(c.path, dtype="float32")
+                if audio.ndim == 2:
+                    audio = audio.mean(axis=1)
+                emb = identifier.embed(audio, sr)
+                c.speaker_embedding = emb.tolist()
+                embedded += 1
+                if embedded % 25 == 0:
+                    logger.info("Backfill: embedded %d clips so far…", embedded)
+            except Exception:
+                logger.exception("Backfill embed failed for %s", c.path)
+
+        # 2. Cluster all embedded clips per bucket using OFFLINE average-link
+        #    agglomerative clustering. Average-link looks at the mean of all
+        #    cross-cluster pairwise sims, which is more stable than online
+        #    centroid drift and avoids the chain-collapse failure mode of
+        #    single-link / online-sequential. After the initial cut we run
+        #    centroid-refinement iterations so noisy outlier clips can
+        #    re-attach to whichever cluster their MEAN embedding lives in.
+        identified = 0
+        bucket_to_clips: dict[str, list] = {}
+        for c in self.clips:
+            if not c.speaker_embedding:
+                continue
+            bucket_to_clips.setdefault(c.phrase_type, []).append(c)
+
+        for bucket, clips_in_bucket in bucket_to_clips.items():
+            if not clips_in_bucket:
+                continue
+            assignments = _cluster_speakers(
+                clips_in_bucket,
+                threshold=cur_thr,
+                logger=logger,
+                bucket_label=bucket,
+            )
+            for c, sid in zip(clips_in_bucket, assignments):
+                c.speaker_id = sid
+                identified += 1
+
+        speakers_total = len({c.speaker_id for c in self.clips if c.speaker_id})
+        if embedded or identified:
+            self._save_state()
+        logger.info(
+            "Speaker backfill: embedded=%d identified=%d → %d speakers across %d clips",
+            embedded, identified, speakers_total, len(self.clips),
+        )
+        return {
+            "clips_embedded": embedded,
+            "clips_identified": identified,
+            "speakers_total": speakers_total,
+        }
+
+    # --- selection helpers (continued) -----------------------------------
+
     def mark_played(self, paths: list[str]):
         import time as _t
         now = _t.time()
@@ -328,3 +620,122 @@ class MemoryStore:
                 changed = True
         if changed:
             self._save_state()
+
+
+# ----------------------------------------------------------------------
+# Speaker clustering — offline batch with average-link + centroid refine
+# ----------------------------------------------------------------------
+
+def _cluster_speakers(clips: list, threshold: float, logger,
+                       bucket_label: str = "",
+                       refinement_min_sim: float | None = None,
+                       max_iterations: int = 10) -> list[str]:
+    """Cluster a list of ClipEntry by speaker_embedding.
+
+    Returns a parallel list of speaker_id strings (one per input clip).
+
+    Algorithm:
+      1. Stack L2-normalised embeddings into an NxD matrix.
+      2. Compute the NxN cosine similarity matrix.
+      3. Run scipy hierarchical clustering with the 'average' linkage on
+         distances 1 - sim. Cut the dendrogram at (1 - threshold).
+      4. Refinement loop: recompute each cluster's mean embedding (a
+         smoother prototype than any single clip), then reassign every
+         clip to whichever centroid it's closest to as long as the sim
+         clears refinement_min_sim. Iterate until assignments stabilise.
+
+    Average-link is more robust than online sequential clustering: the
+    cluster-similarity is the MEAN of all cross-cluster pair sims, so a
+    chain of weak links can't drag unrelated clips together. The refine
+    step then absorbs noisy outliers via centroid attraction.
+
+    Speaker ids are derived from a hash of each cluster's earliest-by-
+    timestamp clip path, so the same cluster gets the same id across
+    reclusters / restarts. (Eviction of the anchor clip is the only
+    case where the id changes — rare.)
+    """
+    import hashlib
+    import uuid
+    import numpy as np
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import squareform
+
+    n = len(clips)
+    if n == 0:
+        return []
+    if n == 1:
+        return [f"spk_{uuid.uuid4().hex[:8]}"]
+
+    embs = np.stack([
+        np.asarray(c.speaker_embedding, dtype=np.float32) for c in clips
+    ])
+    # Re-normalize (defensive — the encoder already does this)
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    embs = embs / np.clip(norms, 1e-9, None)
+
+    sim = embs @ embs.T
+    np.clip(sim, -1.0, 1.0, out=sim)
+    dist = 1.0 - sim
+    np.fill_diagonal(dist, 0.0)
+    # scipy expects a 1-D condensed distance (upper triangle)
+    cond_dist = squareform(np.clip(dist, 0.0, 2.0), checks=False)
+
+    Z = linkage(cond_dist, method="average")
+    labels = fcluster(Z, t=1.0 - threshold, criterion="distance")
+    initial_n = len(set(labels))
+
+    # Refinement: assign each clip to closest centroid.
+    if refinement_min_sim is None:
+        # Slightly looser than the cut threshold — centroids are stable
+        # enough to absorb noisy clips that didn't make the initial cut.
+        refinement_min_sim = max(0.15, threshold - 0.10)
+
+    for iteration in range(max_iterations):
+        # Compute L2-normalised centroids per cluster
+        unique = np.unique(labels)
+        centroids = np.zeros((len(unique), embs.shape[1]), dtype=np.float32)
+        label_index = {int(lbl): i for i, lbl in enumerate(unique)}
+        for lbl in unique:
+            mask = labels == lbl
+            mean = embs[mask].mean(axis=0)
+            n_ = np.linalg.norm(mean)
+            if n_ > 1e-9:
+                mean = mean / n_
+            centroids[label_index[int(lbl)]] = mean
+
+        # For each clip, find the closest centroid AMONG CLUSTERS IT
+        # ISN'T ALREADY IN. Without this, a singleton's "best centroid"
+        # is itself (sim=1.0) and the refinement never triggers a move.
+        clip_to_centroid = embs @ centroids.T  # N x K
+        for i in range(n):
+            clip_to_centroid[i, label_index[int(labels[i])]] = -1.0
+        best_idx = np.argmax(clip_to_centroid, axis=1)
+        best_sim = clip_to_centroid[np.arange(n), best_idx]
+
+        new_labels = labels.copy()
+        for i in range(n):
+            if best_sim[i] >= refinement_min_sim:
+                new_labels[i] = unique[best_idx[i]]
+        changed = int((new_labels != labels).sum())
+        labels = new_labels
+        if changed == 0:
+            break
+
+    refined_n = len(set(labels))
+    logger.info(
+        "Speaker clustering [%s]: %d clips → %d clusters (avg-link cut %.2f → "
+        "centroid-refine min_sim %.2f, %d iters reduced %d→%d clusters)",
+        bucket_label, n, refined_n, threshold, refinement_min_sim,
+        iteration + 1, initial_n, refined_n,
+    )
+
+    # Map scipy label ints to STABLE speaker_ids — each cluster's id is
+    # a hash of its earliest-by-timestamp member's path, so the same
+    # cluster lands on the same id across reclusters / restarts.
+    label_to_sid: dict[int, str] = {}
+    for lbl in set(int(x) for x in labels):
+        members = [i for i, l in enumerate(labels) if int(l) == lbl]
+        anchor = min(members, key=lambda i: clips[i].timestamp)
+        h = hashlib.sha1(clips[anchor].path.encode("utf-8")).hexdigest()[:8]
+        label_to_sid[lbl] = f"spk_{h}"
+    return [label_to_sid[int(lbl)] for lbl in labels]

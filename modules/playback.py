@@ -6,6 +6,7 @@ and high-shelf rolloff to clean up output through surface transducers.
 
 import logging
 import threading
+import time
 
 import numpy as np
 import soundfile as sf
@@ -128,6 +129,12 @@ class Playback:
         self.device = cfg["audio"].get("output_device")
         self._lock = threading.Lock()
 
+        # Playback-active flag — read by VoskDetector to gate the mic during
+        # chorus output (otherwise the speaker re-triggers itself). Updated
+        # in play_array's try/finally so it's always cleared on exit.
+        self._is_playing = False
+        self._playback_ended_at = 0.0
+
         # Build exciter conditioning filters
         exciter_cfg = cfg.get("exciter", {})
         self._exciter_enabled = exciter_cfg.get("enabled", False)
@@ -151,6 +158,15 @@ class Playback:
         self.master_limiter_enabled = bool(playback_cfg.get("master_limiter_enabled", True))
         logger.info("Output stage: master_gain=%.2f ceiling=%.2f brickwall=%s",
                     self.master_gain, self.master_ceiling, self.master_limiter_enabled)
+
+    def is_playing(self) -> bool:
+        return self._is_playing
+
+    def time_since_playback_end(self) -> float:
+        """Seconds since the last playback finished. inf if it's never played."""
+        if self._is_playing or self._playback_ended_at == 0.0:
+            return 0.0 if self._is_playing else float("inf")
+        return time.monotonic() - self._playback_ended_at
 
     def _condition(self, data: np.ndarray) -> np.ndarray:
         """Apply exciter conditioning if enabled."""
@@ -245,11 +261,15 @@ class Playback:
                 # Use a large blocksize to avoid ALSA underruns
                 sd.default.blocksize = 2048
                 sd.default.latency = "high"
+                self._is_playing = True
                 sd.play(data, sr, device=self.device)
                 if blocking:
                     sd.wait()
             except Exception:
                 logger.exception("Playback failed")
+            finally:
+                self._is_playing = False
+                self._playback_ended_at = time.monotonic()
 
     def play_file(self, path: str, blocking: bool = True):
         """Play a WAV/FLAC/OGG file."""

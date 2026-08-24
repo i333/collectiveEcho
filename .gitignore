@@ -17,10 +17,17 @@ logs/*.log
 state.json
 mood_state.json
 
+# Timestamped backup copies made during live tuning
+*.bak.*
+
+# Generated from gallery_card.md by scripts/build_gallery_card_pdf.py
+gallery_card.pdf
+
 # Audio archives — too large + machine-specific. Fallback recordings
 # (e.g. Sandy's voice) should be downloaded out-of-band or re-recorded.
 audio/live/
 audio/fallback/
+audio/curated/
 
 # Vosk model — download separately on each machine:
 #   wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip

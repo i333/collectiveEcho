@@ -110,6 +110,16 @@ class WLEDController:
         t = threading.Thread(target=_do_flash, daemon=True)
         t.start()
 
+    # --- master brightness override ---------------------------------------
+
+    def set_max_brightness(self):
+        """Force WLED master brightness to 255 so subsequent UDP DRGB frames
+        aren't dimmed by whatever the current preset has set bri to. The
+        fade_out preset, for instance, drops bri to ~5 — UDP frames sent on
+        the next trigger then land at ~2% perceived brightness, which looks
+        like the strip is off. Call this before each UDP react_to_audio."""
+        self._set_state({"bri": 255, "transition": 0})
+
     # --- audio-reactive brightness -----------------------------------------
 
     def _compute_envelope(self, audio: np.ndarray, sr: int) -> np.ndarray:

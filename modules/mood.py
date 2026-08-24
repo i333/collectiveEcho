@@ -61,8 +61,11 @@ class MoodKeeper:
                 data = json.load(f)
             self.lifetime_triggers = int(data.get("lifetime_triggers", 0))
             logger.info("MoodKeeper: lifetime_triggers=%d", self.lifetime_triggers)
-        except Exception:
-            logger.exception("MoodKeeper: could not load mood state")
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            # Corrupt/empty file: silently reset rather than spamming a traceback
+            # on every boot. The next _save() rewrites a clean file.
+            logger.info("MoodKeeper: resetting state (%s)", type(e).__name__)
+            self.lifetime_triggers = 0
 
     def _save(self):
         try:

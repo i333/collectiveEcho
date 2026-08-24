@@ -37,11 +37,22 @@ class QualityReport:
     has_phrase: bool = False
     has_too: bool = False                 # legacy flag, kept for back-compat
     matched_bucket: str = ""              # bucket id from PhraseMatcher (e.g. "ily_sandy")
+    matched_span: str = ""                # the actual phrase pattern that matched
+                                          # (e.g. "i am a monster") — used by
+                                          # _locate_phrase_timing to find the
+                                          # span in the word list, not just for
+                                          # ily-family buckets.
     transcript: str = ""
     transcript_confidence: float = 0.0
     phrase_match_confidence: float = 0.0
     phrase_start_sec: float = -1.0
     phrase_end_sec: float = -1.0
+    # True when there's voiced audio meaningfully past phrase_end_sec —
+    # i.e. the visitor kept talking after "you". For the plain `ily`
+    # bucket we use this to reject the clip from save (a "clean" I love
+    # you is followed by silence; continuation suggests "I love you
+    # Sandy" / "I love you so much" — different tone, not chorus-ready).
+    has_continuation: bool = False
     reject_reasons: list[str] = field(default_factory=list)
     # New: emotion vector (continuous) — populated when an analyzer is wired
     emotion: EmotionReport = field(default_factory=EmotionReport)
@@ -71,9 +82,22 @@ class QualityAnalyzer:
 
         self.sample_rate = cfg["audio"]["sample_rate"]
 
-        # Trim padding around the located phrase
-        self.trim_pad_before = 0.15
-        self.trim_pad_after = 0.25
+        # Trim padding around the located phrase. Both pads were 0.15/0.25
+        # originally; on review, those routinely leaked partial words on
+        # either end ("Sandy, I love you" → "ndy, I love you", and
+        # "I love you Sandy" → "I love you Sa…"). 0.08 each side keeps
+        # the natural decay of the vowels while staying short of any
+        # adjacent syllable. Lift back up if a particular voice's
+        # consonant decay needs more breathing room.
+        # Both pads were progressively tightened as we kept catching leaks:
+        # 0.15/0.25 → 0.08/0.10 → 0.05/0.05 → 0.0/0.05. Pure-zero pre-pad
+        # shaved the "i" vowel onset (Vosk's word.start is at the
+        # consonant boundary, not the actual sibilant attack). 0.02 keeps
+        # the attack while staying short of any hallucinated leading word
+        # — the i_set guard in Strategy 3 of _set_phrase_timing already
+        # prevents "the"/"and" from being included as the prior word.
+        self.trim_pad_before = 0.02
+        self.trim_pad_after = 0.05
 
         # Pluggable backends — injected so factory wiring is in one place
         self.transcriber = transcriber
@@ -150,6 +174,26 @@ class QualityAnalyzer:
                 phrase_rms = float(np.sqrt(np.mean(phrase_samples ** 2)))
                 report.phrase_only_rms = phrase_rms
                 report.rms = phrase_rms
+
+            # Continuation detection: measure voiced audio in a window
+            # starting 50 ms past phrase_end_sec (skip natural decay) up to
+            # 350 ms past. ≥ 30 ms triggers — even a partial "Sa" can be
+            # heard in the chorus mix, so we err strict.
+            window_start = report.phrase_end_sec + 0.05
+            window_end = min(report.duration_sec, report.phrase_end_sec + 0.35)
+            if window_end > window_start:
+                ws = int(window_start * sample_rate)
+                we = int(window_end * sample_rate)
+                frame_n = max(1, int(0.025 * sample_rate))
+                voiced_ms = 0
+                for i in range(ws, we, frame_n):
+                    chunk = samples[i:i + frame_n]
+                    if len(chunk) == 0:
+                        break
+                    if float(np.sqrt(np.mean(chunk ** 2))) >= 0.012:
+                        voiced_ms += 25
+                if voiced_ms >= 30:
+                    report.has_continuation = True
 
         report.is_intimate = report.rms < self.intimate_rms
         report.is_strong = report.rms >= self.strong_rms
@@ -233,6 +277,7 @@ class QualityAnalyzer:
         if hit is not None:
             report.has_phrase = True
             report.matched_bucket = hit.phrase_type
+            report.matched_span = hit.matched_span
             report.has_too = hit.phrase_type == "ily_too"
             report.phrase_match_confidence = hit.confidence
             if tr.words:
@@ -243,22 +288,57 @@ class QualityAnalyzer:
     def _locate_phrase_timing(self, words, report: QualityReport):
         """Walk word list to find the phrase span; cache start/end timings.
 
-        Extends the span past 'you' to include either 'too/to/two' or any
+        Strategy:
+          1. PREFERRED: locate the matched_span (e.g. 'i am a monster',
+             'i love you sandy') token-by-token in the word list. Allows
+             apostrophe / pronoun-variant normalization so 'i'm a monster'
+             matches Vosk word boundaries like ['im', 'a', 'monster'].
+          2. FALLBACK (ily-family only): hardcoded 'i love you' pattern
+             matching for cases where the matcher matched via name_anchor
+             or phonetic and matched_span doesn't actually appear in the
+             transcript.
+
+        Extends the span past the end to include either 'too/to/two' or any
         per-bucket extra anchor word (e.g. 'sandy') so trimming preserves
-        the trailing name in the recording.
+        trailing context.
+
+        WITHOUT this generalization (pre-fix), only 'i'/'love'/'you' word
+        sequences got phrase_start_sec set — every monster (and future
+        non-ily) clip skipped trimming and saved the full 5s capture.
         """
+        if not words:
+            return
         texts = [w.text for w in words]
-        # Build a "name extension" set from the matched bucket's anchor_extra.
         bucket = self.matcher.get_bucket(report.matched_bucket) if report.matched_bucket else None
         extra_anchors = set((bucket.anchor_extra if bucket else []) or [])
 
+        # --- Strategy 1: matched_span direct lookup -----------------------
+        if report.matched_span:
+            span_words = [t for t in report.matched_span.lower().split() if t]
+            timing = self._find_span_timing(texts, span_words)
+            if timing is not None:
+                start_idx, end_idx = timing
+                # Extend past end for 'too' or anchor_extra word
+                if end_idx + 1 < len(texts):
+                    nxt = texts[end_idx + 1]
+                    if nxt in ("too", "to", "two"):
+                        end_idx += 1
+                        report.has_too = True
+                    elif nxt in extra_anchors:
+                        end_idx += 1
+                report.phrase_start_sec = max(0, words[start_idx].start - self.trim_pad_before)
+                report.phrase_end_sec = words[end_idx].end + self.trim_pad_after
+                return
+
+        # --- Strategy 2: hardcoded 'i love you' fallback ------------------
+        # Catches name_anchor / phonetic matches where matched_span doesn't
+        # appear verbatim in the ASR output.
         for i in range(len(texts) - 2):
             if (texts[i] == "i"
                     and texts[i + 1] == "love"
                     and texts[i + 2] in ("you", "u", "yo", "ya", "yew")):
                 report.phrase_start_sec = max(0, words[i].start - self.trim_pad_before)
                 end_idx = i + 2
-                # Look one word past 'you' for "too/to" OR a bucket anchor name.
                 if i + 3 < len(texts):
                     nxt = texts[i + 3]
                     if nxt in ("too", "to", "two"):
@@ -268,14 +348,53 @@ class QualityAnalyzer:
                         end_idx = i + 3
                 report.phrase_end_sec = words[end_idx].end + self.trim_pad_after
                 return
-        # Fallback: locate around 'love'
+        # Last-ditch: locate around 'love' alone. Only include the word
+        # BEFORE 'love' if it's actually an 'i' variant — Vosk often
+        # hallucinates "the"/"and"/"that" when the leading "I" vowel is
+        # quiet, and including that filler word leaks into playback.
+        i_set = {"i", "im", "ive", "ill"}
         for i, w in enumerate(texts):
             if w == "love":
-                start_idx = max(0, i - 1)
+                start_idx = i - 1 if (i > 0 and texts[i - 1] in i_set) else i
                 end_idx = min(len(words) - 1, i + 1)
                 report.phrase_start_sec = max(0, words[start_idx].start - self.trim_pad_before)
                 report.phrase_end_sec = words[end_idx].end + self.trim_pad_after
                 return
+
+    @staticmethod
+    def _find_span_timing(texts: list[str], span: list[str]) -> tuple[int, int] | None:
+        """Sliding-window search for `span` inside `texts`. Allows minor
+        tokenization differences:
+          - apostrophes are stripped before compare ("i'm" == "im")
+          - "you/u/yo/ya/yew" are interchangeable
+          - "i / im / ive" are interchangeable
+        Returns (start_idx, end_idx) inclusive, or None if no match.
+        """
+        n = len(span)
+        if n == 0 or n > len(texts):
+            return None
+
+        you_set = {"you", "u", "yo", "ya", "yew"}
+        i_set = {"i", "im", "ive", "ill"}
+
+        def _norm(t: str) -> str:
+            return t.replace("'", "").replace("’", "").lower()
+
+        def _eq(transcript_tok: str, span_tok: str) -> bool:
+            t = _norm(transcript_tok)
+            s = _norm(span_tok)
+            if t == s:
+                return True
+            if s in you_set and t in you_set:
+                return True
+            if s in i_set and t in i_set:
+                return True
+            return False
+
+        for i in range(len(texts) - n + 1):
+            if all(_eq(texts[i + j], span[j]) for j in range(n)):
+                return (i, i + n - 1)
+        return None
 
     # --- trim and gates ---------------------------------------------------
 
@@ -295,6 +414,16 @@ class QualityAnalyzer:
         return trimmed
 
     def should_save(self, report: QualityReport) -> bool:
+        # Plain "ily" bucket is the chorus default — only accept clean
+        # "I love you" takes (silence after). Continued speech is a
+        # different tone (calling someone's name, follow-on words) and
+        # tends to feel out of place when layered with others. Other
+        # buckets (ily_too, ily_sandy, monster) expect a trailing word
+        # by design, so don't apply the gate there.
+        if report.has_continuation and report.matched_bucket == "ily":
+            if "continued_speech" not in report.reject_reasons:
+                report.reject_reasons.append("continued_speech")
+            return False
         return report.has_phrase and report.score >= self.save_threshold
 
     def should_use_fallback(self, report: QualityReport) -> bool:

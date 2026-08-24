@@ -246,6 +246,26 @@ def simple_reverb(audio: np.ndarray, sample_rate: int,
     return out
 
 
+def reverb_tail(audio: np.ndarray, sample_rate: int,
+                decay: float = 0.3, delay_ms: float = 60) -> np.ndarray:
+    """Comb-filter reverb TAIL only — same taps as simple_reverb but WITHOUT
+    the dry copy. Used as the shared reverb on a wet send bus, where the dry
+    signal is mixed separately (adding it here would double it)."""
+    delay_samples = int(delay_ms / 1000.0 * sample_rate)
+    if delay_samples <= 0 or decay <= 0:
+        return np.zeros_like(audio)
+
+    out = np.zeros_like(audio)
+    for tap in range(1, 5):
+        offset = delay_samples * tap
+        gain = decay ** tap
+        if offset < len(out):
+            end = min(len(audio), len(out) - offset)
+            out[offset: offset + end] += audio[:end] * gain
+
+    return out
+
+
 def layer_clips(clips: list[np.ndarray], sample_rate: int,
                 cfg_playback: dict) -> np.ndarray:
     """
@@ -270,14 +290,41 @@ def layer_clips(clips: list[np.ndarray], sample_rate: int,
     reverb_on = cfg_playback.get("reverb_enabled", False)
     reverb_decay = cfg_playback.get("reverb_decay", 0.3)
     reverb_delay = cfg_playback.get("reverb_delay_ms", 60)
+    # Per-layer reverb depth. Instead of one flat reverb over the whole mix,
+    # each layer gets its own send into a SHARED reverb bus (one "room"):
+    #   - newest voice: LONG pre-delay + low wet ratio → direct sound arrives
+    #     well before the reflections → reads as close to the listener.
+    #   - oldest voice: near-zero pre-delay + high wet ratio → direct and
+    #     reverberant field arrive together → reads as deep in the room.
+    # This is how distance actually behaves acoustically, and it compounds
+    # with the low-pass darkening + volume decay below. Falls back to the
+    # flat shared reverb when disabled.
+    reverb_per_layer = cfg_playback.get("reverb_per_layer", False)
+    wet_newest = cfg_playback.get("reverb_wet_newest", 0.12)
+    wet_oldest = cfg_playback.get("reverb_wet_oldest", 0.45)
+    predelay_newest_ms = cfg_playback.get("reverb_predelay_newest_ms", 50)
+    predelay_oldest_ms = cfg_playback.get("reverb_predelay_oldest_ms", 10)
 
     # Tuning parameters
     base_delay_sec = cfg_playback.get("layer_delay_sec", 0.10)
+    # Minimum gap between consecutive layers — golden-ratio growth alone
+    # crowds the first few layers ("phrases crash at the start"). The
+    # floor enforces a perceptual minimum without changing the tail
+    # (PHI takes over once its delta exceeds the floor). Set to 0 to
+    # disable and revert to pure golden-ratio.
+    min_gap_sec = cfg_playback.get("layer_min_gap_sec", 0.0)
     volume_decay = cfg_playback.get("layer_volume_decay", 0.85)
     detune_cents = cfg_playback.get("detune_cents", 7.0)
     lp_oldest_hz = cfg_playback.get("lp_oldest_hz", 3500)
     lp_newest_hz = cfg_playback.get("lp_newest_hz", 8000)
     transient_soften_ms = cfg_playback.get("transient_soften_ms", 20)
+    # Per-clip loudness normalization so the volume_decay curve actually
+    # produces a smooth fall-off. Without this, a quiet take + decay
+    # multiplier ends up much softer than a normal take at the same age,
+    # giving a "bumpy" chorus. Gain is capped so we don't amplify near-
+    # silent clips into pure noise.
+    layer_norm_target_rms = cfg_playback.get("layer_norm_target_rms", 0.10)
+    layer_norm_max_gain = cfg_playback.get("layer_norm_max_gain", 3.0)
 
     # Panning positions: center for newest, alternating L/R for older
     # Layer 0 (newest) = 0.0 (center)
@@ -290,10 +337,30 @@ def layer_clips(clips: list[np.ndarray], sample_rate: int,
     fade_out_n = int(fade_out_sec * sample_rate)
     soften_n = int(transient_soften_ms / 1000.0 * sample_rate)
 
+    # Precompute layer start times. age 0 = newest = 0s. Each subsequent
+    # layer = max(prev + min_gap, base * PHI^(age-1)). This floors the
+    # crowded early gaps without touching the tail (PHI catches up
+    # whenever its delta exceeds the floor).
+    delays_by_age = [0.0] * n
+    for age in range(1, n):
+        phi_delay = base_delay_sec * (PHI ** (age - 1))
+        delays_by_age[age] = max(delays_by_age[age - 1] + min_gap_sec,
+                                  phi_delay)
+
     processed = []
     for i, clip in enumerate(clips):
         audio = normalize_audio(clip)
         age = n - 1 - i  # 0 for newest, higher for older
+
+        # --- Per-clip loudness normalization (mic-distance compensation) ---
+        # Every clip starts at the same RMS so the volume_decay curve is
+        # the only thing modulating layer loudness. Gain capped to avoid
+        # amplifying near-silent or noise-heavy takes.
+        if layer_norm_target_rms > 0:
+            clip_rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+            if clip_rms > 1e-5:
+                gain = min(layer_norm_target_rms / clip_rms, layer_norm_max_gain)
+                audio = audio * gain
 
         # --- Pitch detuning: alternate sharp/flat, newest stays natural ---
         if age > 0:
@@ -323,11 +390,9 @@ def layer_clips(clips: list[np.ndarray], sample_rate: int,
         vol = volume_decay ** age
         audio = apply_volume(audio, vol)
 
-        # --- Golden-ratio delay offsets ---
+        # --- Delay offsets (precomputed; see delays_by_age above) ---
         if age > 0:
-            # Delay sequence: base * phi^0, base * phi^1, base * phi^2, ...
-            delay_sec = base_delay_sec * (PHI ** (age - 1))
-            delay_samples = int(delay_sec * sample_rate)
+            delay_samples = int(delays_by_age[age] * sample_rate)
             audio = apply_delay(audio, delay_samples)
 
         # --- Transient softening on older layers ---
@@ -338,23 +403,63 @@ def layer_clips(clips: list[np.ndarray], sample_rate: int,
         audio = fade_in(audio, fade_in_n)
         audio = fade_out(audio, fade_out_n)
 
-        processed.append(audio)
+        processed.append((audio, age))
 
     # --- Mix all layers into one stereo buffer ---
-    max_len = max(len(a) for a in processed)
+    max_len = max(len(a) for a, _ in processed)
     mixed = np.zeros((max_len, 2), dtype=np.float32)
-    for audio in processed:
+    for audio, _ in processed:
         mixed[:len(audio)] += audio
 
-    # --- Shared reverb on the final mix ---
-    if reverb_on:
+    # --- Shared reverb ---
+    if reverb_on and reverb_per_layer and n > 0:
+        # Per-layer wet sends into ONE shared reverb bus (single "room").
+        # Each layer's send is pre-delayed and gain-scaled by its age:
+        # newest = long pre-delay / dry-ish (close), oldest = short
+        # pre-delay / wet (deep in the room). See knob comments above.
+        max_tail = int(max(predelay_newest_ms, predelay_oldest_ms)
+                       / 1000.0 * sample_rate)
+        wet_bus = np.zeros((max_len + max_tail, 2), dtype=np.float32)
+        for audio, age in processed:
+            t = age / max(1, n - 1)  # 0 = newest, 1 = oldest
+            wet_gain = wet_newest + t * (wet_oldest - wet_newest)
+            predelay_ms = predelay_newest_ms + t * (predelay_oldest_ms
+                                                    - predelay_newest_ms)
+            pre_n = int(predelay_ms / 1000.0 * sample_rate)
+            end = min(len(audio), len(wet_bus) - pre_n)
+            if end > 0 and wet_gain > 0:
+                wet_bus[pre_n: pre_n + end] += audio[:end] * wet_gain
+        tail = reverb_tail(wet_bus, sample_rate,
+                           decay=reverb_decay, delay_ms=reverb_delay)
+        out_len = max(max_len, len(tail))
+        out = np.zeros((out_len, 2), dtype=np.float32)
+        out[:max_len] += mixed
+        out[:len(tail)] += tail
+        mixed = out
+    elif reverb_on:
         mixed = simple_reverb(mixed, sample_rate,
                               decay=reverb_decay, delay_ms=reverb_delay)
 
-    # --- Normalize to audible level ---
-    peak = np.max(np.abs(mixed))
-    if peak > 0:
-        mixed = mixed / peak * 0.8
-        logger.debug("Normalized layered mix (peak was %.4f)", peak)
+    # --- Loudness-normalize the final mix ---
+    # Normalize by RMS toward a fixed target, NOT by peak. Peak-normalizing
+    # (mixed / peak * 0.8) divided the whole chorus by its single loudest
+    # sample, so one transient in any clip dragged perceived loudness down and
+    # partly undid the layer_volume_decay curve — chorus loudness then varied
+    # trigger-to-trigger with whatever the loudest sample happened to be.
+    # RMS-normalizing keeps the chorus BODY at a constant level every time; the
+    # brickwall limiter in playback._master_stage is the sole peak ceiling.
+    target_rms = cfg_playback.get("layer_mix_target_rms", 0.12)
+    rms = float(np.sqrt(np.mean(mixed ** 2)))
+    if rms > 1e-6 and target_rms > 0:
+        gain = target_rms / rms
+        # Safety only: keep transients under unity before the master stage so
+        # the resampler/limiter never sees float overshoot. The brickwall in
+        # playback is the real ceiling — we don't peak-normalize here.
+        peak = float(np.max(np.abs(mixed)))
+        if peak * gain > 0.99:
+            gain = 0.99 / peak
+        mixed = mixed * gain
+        logger.debug("Layer mix RMS-normalized (rms=%.4f→%.4f, gain=%.2f, peak=%.3f)",
+                      rms, rms * gain, gain, float(np.max(np.abs(mixed))))
 
     return mixed

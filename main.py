@@ -27,6 +27,7 @@ from modules.emotion import create_emotion_analyzer
 from modules.mood import MoodKeeper
 from modules.phrase_match import PhraseMatcher, buckets_from_config
 from modules.pipeline import TriggerPipeline
+from modules.speaker import SpeakerIdentifier
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -68,9 +69,13 @@ class Mirror:
         self.audio_input = AudioInput(cfg)
         self.memory = MemoryStore(cfg)
         self.memory.configure_buckets(self.buckets)
-        self.detector = create_detector(cfg, matcher=self.matcher)
         self.recorder = Recorder(cfg, memory_store=self.memory)
         self.playback = Playback(cfg)
+        # Detector needs the playback ref so it can mute the mic during
+        # chorus output (otherwise the speaker re-triggers Vosk through
+        # the mic and feeds back).
+        self.detector = create_detector(cfg, matcher=self.matcher,
+                                         playback=self.playback)
 
         # WLED — keep HTTP path; optionally enable UDP realtime
         self.wled = WLEDController(cfg)
@@ -96,6 +101,16 @@ class Mirror:
         # Slow behavioral state
         self.mood_keeper = MoodKeeper(state_file=cfg["memory"].get("state_file", "state.json"))
 
+        # Speaker identification — warms up the ECAPA encoder (cuda if avail.)
+        # and backfills speaker_ids for any previously-saved clip that hasn't
+        # been clustered yet. Soft-fails if speechbrain isn't installed.
+        self.speaker = self._maybe_build_speaker(cfg)
+        if self.speaker is not None:
+            try:
+                self.memory.backfill_speakers(self.speaker)
+            except Exception:
+                self.logger.exception("Speaker backfill failed (continuing)")
+
         # Trigger pipeline
         self.pipeline = TriggerPipeline(
             cfg=cfg,
@@ -108,9 +123,26 @@ class Mirror:
             wled_rt=self.wled_rt,
             mood_keeper=self.mood_keeper,
             matcher=self.matcher,
+            speaker=self.speaker,
         )
 
         self._running = False
+
+    def _maybe_build_speaker(self, cfg: dict):
+        """Build + warm up the speaker identifier if enabled in config.
+        Returns None if disabled or speechbrain isn't installed (so the
+        chorus pipeline still runs, just without speaker dedup)."""
+        sc = cfg.get("speaker", {}) or {}
+        if not sc.get("enabled", True):
+            return None
+        try:
+            ident = SpeakerIdentifier(cfg)
+            ident.warmup()
+            return ident
+        except Exception:
+            self.logger.exception(
+                "SpeakerIdentifier unavailable — chorus will skip speaker dedup")
+            return None
 
     @staticmethod
     def _maybe_build_wled_rt(cfg: dict):

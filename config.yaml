@@ -15,26 +15,26 @@ audio:
   format: int16
   pre_detection_buffer_sec: 4.0
   post_detection_sec: 2.0     # legacy fixed-duration fallback
-  # PortAudio device indices (probed 2026-05-14):
-  #   25 = USB Lavalier Microphone (DCMT, native 44100Hz, in×1)
-  #   24 = AB13X USB Audio (amp, native 48000Hz, out×2)
+  # PortAudio device indices (re-probed 2026-05-14 on new 64GB card):
+  #   1 = USB Lavalier Microphone (hw:1,0, native 44100Hz, in×1)
+  #   0 = AB13X USB Audio (hw:0,0, native 48000Hz, out×2)
   # AudioInput / Playback auto-detect each device's native rate and resample
   # to/from the pipeline rate (16000Hz). Set null to use system default.
-  input_device: 25
-  output_device: 24
+  input_device: 1
+  output_device: 0
   # Adaptive capture — keep recording until end-of-utterance silence
   adaptive_capture:
     enabled: true
     min_post_sec: 1.0         # always capture at least this much
     max_post_sec: 5.0         # hard ceiling regardless of speech
-    eos_silence_rms: 0.005    # below this counts as silence
-    eos_silence_sec: 0.7      # trailing silence required to stop
+    eos_silence_rms: 0.012    # below this counts as silence (0.008→0.012 — most clips were 7-9s due to trailing room noise; tighter cut trims to actual speech length)
+    eos_silence_sec: 0.4      # trailing silence required to stop (0.7→0.4 — faster cutoff so EOS trips before max_post_sec)
 
 # Volume / quality thresholds
 thresholds:
   intimate_rms: 0.005
   strong_rms: 0.02
-  noise_floor_rms: 0.0005
+  noise_floor_rms: 0.002
   max_clipping_ratio: 0.05
   min_duration_sec: 0.8
   max_duration_sec: 6.5       # was 5.0 — DEVLOG #4 noted clips were 6.05s with adaptive capture this can shrink again
@@ -90,7 +90,12 @@ phrases:
       anchor_extra: [sandy]
       live_dir: audio/live/i_love_you_sandy
       fallback_dir: audio/fallback/i_love_you_sandy
-      save_user_recordings: false
+      # Collect "I love you Sandy" recordings to the live dir for future use
+      # but DON'T play them back yet — response_files_only=true keeps Sandy
+      # responses sourced exclusively from the curated fallback dir, and the
+      # bucket is auto-isolated (see PhraseMatcher.isolated_bucket_ids) so
+      # these clips never bleed into the default ily pool either.
+      save_user_recordings: true
       response_files_only: true
 
     # "I love you too" — checked before plain "ily" so it doesn't get swallowed.
@@ -105,6 +110,79 @@ phrases:
         - "i love yew too"
       live_dir: audio/live/i_love_you_too
       fallback_dir: audio/fallback/i_love_you_too
+
+    # "Jetson turn a new page" — system command. Short-circuits the pipeline
+    # to archive every live clip into a timestamped subdir under its bucket's
+    # live_dir and clear state.json so the chorus pool starts fresh. Doesn't
+    # touch fallback dirs (Sandy memorial responses stay intact). Highest
+    # priority so it wins decisively. anchor_words=[jetson] makes it isolated
+    # — never bleeds into any other bucket's pool, never matches accidentally.
+    - id: archive_command
+      priority: 50
+      patterns:
+        - "jetson turn a new page"
+        - "jetson turn the page"
+        - "jetson new page"
+      anchor_words: [jetson]
+      command: archive_clips
+      save_user_recordings: false
+
+    # Companion to archive_command — reads each archive subdir's manifest.json
+    # and restores every clip back into its original bucket with full metadata
+    # (score, emotion vectors, timestamp). Idempotent: a manifest that's
+    # already been consumed is skipped. Filename collisions append __restoredN.
+    - id: restore_command
+      priority: 50
+      patterns:
+        - "jetson remember it all"
+        - "jetson remember everything"
+        - "jetson remember all"
+      anchor_words: [jetson]
+      command: restore_archives
+      save_user_recordings: false
+
+    # "Jetson sleep" / "Jetson wake up" — pause/resume active listening.
+    # While asleep the detector and idle lights keep running, but every
+    # trigger EXCEPT the wake command is ignored — no chorus, no capture,
+    # no other commands. The asleep flag is in-memory ON PURPOSE: a reboot
+    # always comes back awake (the requested boot default).
+    - id: sleep_command
+      priority: 50
+      patterns:
+        - "jetson sleep"
+        - "jetson go to sleep"
+        - "jetson stop listening"
+      anchor_words: [jetson]
+      command: sleep_listening
+      save_user_recordings: false
+
+    - id: wake_command
+      priority: 50
+      patterns:
+        - "jetson wake up"
+        - "jetson wake"
+        - "jetson start listening"
+      anchor_words: [jetson]
+      command: wake_listening
+      save_user_recordings: false
+
+    # "I am a monster" — fully independent of the love family. Uses its own
+    # required-anchor word ("monster") instead of the universal love-anchor,
+    # so love phrases never route here and monster phrases never route to ily.
+    # Saves user recordings and layers like ily — its own growing chorus.
+    - id: monster
+      priority: 25
+      patterns:
+        - "i am a monster"
+        - "im a monster"
+        - "i'm a monster"
+        - "i am monster"
+        - "i'm monster"
+        - "im monster"
+        - "i am the monster"
+      anchor_words: [monster]
+      live_dir: audio/live/i_am_a_monster
+      fallback_dir: audio/fallback/i_am_a_monster
 
     # Default "I love you" bucket — lowest priority, catches everything else.
     - id: ily
@@ -134,6 +212,30 @@ whisper:
   language: en
   beam_size: 1
   vad_filter: true
+
+# Speaker identification — diarizes the chorus pool so a single voice can't
+# dominate a response. Each saved clip is embedded with SpeechBrain's
+# ECAPA-TDNN encoder; clips above `similarity_threshold` cosine collapse
+# into one speaker_id. Layered responses then take at most one clip per id.
+speaker:
+  enabled: true
+  model: speechbrain/spkrec-ecapa-voxceleb
+  # CPU is the safe default on Jetson — ECAPA-TDNN is small (~14M params)
+  # and embeds a clip in <200ms on the Orin CPU. Switch to cuda only if you
+  # confirm GPU memory headroom alongside Whisper/SER.
+  device: cpu
+  # Average cosine similarity threshold for grouping clips into one
+  # speaker_id at backfill time. We use offline agglomerative average-
+  # link clustering plus a centroid-refinement pass, so this is the
+  # AVERAGE of all cross-cluster pair sims a cluster must clear (not
+  # the min — that would be complete-link, too conservative — nor the
+  # max — single-link, prone to chain-collapse). Sandy's two
+  # different-phrase clips land at cos=0.636, and a typical user
+  # testing burst averages ~0.30–0.35 in pair sim across 5+ clips, so
+  # 0.30 captures both while keeping distinct visitor pairs (typical
+  # avg <0.15) apart.
+  similarity_threshold: 0.30
+  savedir: models/speaker_ecapa_voxceleb
 
 # Emotion backend — "prosody" (CPU, no deps) or "wav2vec_ser" (Jetson GPU)
 emotion:
@@ -168,9 +270,69 @@ playback:
   master_ceiling: 0.25
   master_limiter_enabled: true
 
-  max_layers: 8
-  layer_delay_sec: 0.35
-  layer_volume_decay: 0.65
+  max_layers: 10
+  # Speaker-dedup chorus selection (V2.1+):
+  #   layered_recent_count: this many most-recent DISTINCT speakers are
+  #                         pinned into every layered response (deterministic,
+  #                         no random selection). For each pinned speaker we
+  #                         play their NEWEST clip — it already cleared the
+  #                         save-threshold quality gate.
+  #   layered_random_count: how many additional distinct speakers are
+  #                         uniformly sampled from the rest of the bucket.
+  #                         For each random speaker we play their HIGHEST-
+  #                         QUALITY clip so the random tail stays polished.
+  #                         Combined with recent_count this defines the
+  #                         target chorus size — fallback clips top up only
+  #                         if the live pool can't reach that many speakers.
+  layered_recent_count: 3
+  layered_random_count: 5
+  # Speakers whose best-quality clip falls below `layered_min_quality` are
+  # dropped from the RANDOM pool (pinned slots ignore this — those
+  # contributors earned their spot via the save_threshold gate). Save bar
+  # is 0.4; setting this higher keeps the random part of the chorus tighter.
+  layered_min_quality: 0.5
+  # DEPRECATED — preserved for back-compat. The new speaker-dedup chorus
+  # uses uniform random selection of distinct speakers; quality weighting
+  # happens implicitly via the per-speaker best-clip pick. Adjust
+  # layered_min_quality instead if you want to tighten the random pool.
+  layered_quality_weight: 1.5
+  # Chorus-time embedding dedup. At chorus build time we reject any
+  # candidate whose embedding cosine sim ≥ this threshold against the
+  # CENTROID of any already-selected speaker's cluster. Comparing
+  # against the cluster centroid (mean of all that speaker's clips) is
+  # smoother than comparing against a single clip, so it catches more
+  # of the "probably same speaker" cases without false-merging distinct
+  # voices. Set to 0 to disable.
+  chorus_dedup_threshold: 0.30
+  # Base delay between chorus layers, grown by the golden ratio per layer
+  # (delay_n = base * PHI^(age-1)). Tuning history:
+  #   0.35 → 8th layer at 6.3s — too distant
+  #   0.20 → 8th at 3.6s — but front gaps too tight (front phrases crash)
+  #   0.28 → 8th at 5.0s — middle ground, PHI character preserved
+  layer_delay_sec: 0.28
+  # Floor between consecutive layer starts (linear-style minimum). Set
+  # to 0 to use pure golden-ratio growth. 0.35 with base=0.20 produced
+  # a too-linear feel in the first 5 layers; pure PHI is more organic.
+  layer_min_gap_sec: 0.0
+  # 0.65 → 0.78: with 12 layers, 0.65^11 ≈ 0.009 (oldest inaudible). 0.78^11
+  # ≈ 0.07 — older voices stay perceivable in the chorus while newest still
+  # leads. Drop back to 0.65-0.70 if the mix becomes muddy.
+  layer_volume_decay: 0.72
+  # Per-clip loudness normalization at layering time. The clip enhancer
+  # targets RMS 0.10 at save, but the actual on-disk RMS still varies
+  # (0.04–0.14 across the pool). Re-normalising here ensures the
+  # volume_decay falls off smoothly regardless of mic-distance / recording
+  # level. `max_gain` caps how much we'll boost a quiet clip so noise
+  # doesn't get amplified into the chorus.
+  layer_norm_target_rms: 0.10
+  layer_norm_max_gain: 3.0
+  # Loudness target for the FINAL chorus mix (RMS). Replaces the old
+  # peak-normalize, which divided the whole mix by its single loudest sample
+  # and made chorus loudness jump trigger-to-trigger. RMS-normalizing keeps
+  # the chorus body constant; the master brickwall (playback.master_ceiling)
+  # remains the sole peak ceiling. Raise for a louder chorus, lower if the
+  # limiter is working too hard. 0 disables mix normalization entirely.
+  layer_mix_target_rms: 0.12
   detune_cents: 7.0
   lp_oldest_hz: 3500
   lp_newest_hz: 8000
@@ -180,10 +342,21 @@ playback:
   reverb_enabled: true
   reverb_decay: 0.3
   reverb_delay_ms: 60
+  # Per-layer reverb depth (one shared "room", per-voice distance).
+  # Each layer gets its own send into the shared reverb bus:
+  #   newest voice → long pre-delay + low wet ratio  → reads as CLOSE
+  #   oldest voice → short pre-delay + high wet ratio → reads as DEEP
+  # Matches real room acoustics and compounds with lp_oldest_hz darkening
+  # and layer_volume_decay. Set false to revert to the flat shared reverb.
+  reverb_per_layer: true
+  reverb_wet_newest: 0.12       # wet send gain for the newest (front) voice
+  reverb_wet_oldest: 0.45       # wet send gain for the oldest (deepest) voice
+  reverb_predelay_newest_ms: 50 # reflections lag the front voice by this much
+  reverb_predelay_oldest_ms: 10 # deepest voice: reverb arrives almost with it
 
 # WLED — HTTP path (presets)
 wled:
-  host: "http://192.168.0.11"
+  host: "http://wled.local"
   timeout_sec: 2
   presets:
     idle: 1
@@ -198,8 +371,8 @@ wled:
     update_hz: 12
   # WLED realtime UDP (DRGB) — direct per-LED color, 60+ Hz
   realtime:
-    enabled: false              # set true (or pass --udp-wled) to activate
-    host: "192.168.0.11"        # WLED controller IP — no scheme
+    enabled: true               # per-LED color from (valence, arousal); see modules/wled_udp.py:emotion_field
+    host: "wled.local"        # WLED controller IP — no scheme
     port: 21324                 # DRGB UDP port
     num_leds: 210               # set to your strip length (probed from WLED-Gledopto on 2026-05-14)
     hold_timeout_s: 2
@@ -207,12 +380,58 @@ wled:
     # ~44 fps max regardless of input rate (probed 2026-05-14). 30 matches
     # comfortably and saves CPU + UDP traffic.
     update_hz: 30
+    # Asleep indicator ("jetson sleep") — the strip breathes slowly in this
+    # RGB color while listening is paused, so the sleep state is visible at
+    # a glance. One inhale+exhale takes sleep_breath_s seconds.
+    sleep_color: [20, 40, 140]    # deep blue
+    sleep_breath_s: 6.0
 
 # Vosk
 vosk:
   model_path: "models/vosk-model-small-en-us-0.15"
   cooldown_sec: 3.0
-  partial_confidence_min: 0.75  # required confidence to fire from a partial result
+  partial_confidence_min: 0.80  # confidence floor for a PARTIAL-result trigger. Matcher tiers: phonetic=0.80, slang=0.85, name_anchor(Sandy)=0.90, exact=1.0. 0.80 lets phonetic near-misses + Sandy fire on the streaming path again (0.92 blocked everything but a perfect exact match, which is why the wake stopped picking up). False positives from grammar-forced junk are handled by cross_validate below, not by this floor.
+  final_confidence_min: 0.0     # confidence floor for a FINAL-result trigger. Finals are the reliable path and are already guarded by cross_validate; 0.0 = accept anything the matcher returns. Raise toward 0.80 only if honest finals start false-firing despite cross-validation.
+  # Mute the wake detector while the speaker is playing AND for this many
+  # seconds afterward — stops the chorus from re-triggering itself through
+  # the mic. Tail covers room reverb + ALSA buffer drain. Raise if you still
+  # hear feedback re-triggers; lower if it makes back-to-back triggers feel
+  # sluggish.
+  mute_cooldown_sec: 0.6
+  # Defer partial-result triggers by this many seconds before firing them,
+  # so a more specific (higher-priority) bucket can supersede if it appears
+  # in the transcript within the window. Without this, "i love you"
+  # (ily) fires before "sandy" arrives and the ily_sandy bucket loses its
+  # turn. Final results bypass the wait. Lower = snappier ily, but more
+  # likely to mis-route Sandy/etc.
+  defer_partial_sec: 0.6
+  # Cross-validation against a parallel FULL-VOCAB recognizer. Grammar mode
+  # biases Kaldi toward our known wake phrases, so random speech ("have
+  # you", "i'm a rectangle") gets transcribed as the closest wake phrase
+  # at conf=1.0 — that's the looseness people hear. The full-vocab pass
+  # transcribes whatever was actually said; if its recent transcript
+  # doesn't contain ANY wake anchor (love-word or a bucket anchor_word),
+  # we suppress the grammar trigger. Sandy still works because grammar
+  # is allowed to disambiguate the BUCKET — we just require the love-word
+  # to also show up in the honest transcript. Costs ~1x extra CPU on the
+  # audio path (Vosk small is ~5% of one Orin CPU core, so still cheap).
+  cross_validate:
+    enabled: true
+    # Drop the last full-vocab final result if older than this many seconds.
+    # Prevents a fresh grammar hit from being validated against a stale
+    # transcript captured before a long silence.
+    staleness_sec: 4.0
+    # Strict pair validation (2026-08-20). Anchor-only checking accepted ANY
+    # word starting with lov/luv anywhere in the snapshot, so conversation
+    # like "I'd love to…" / "lovely" validated grammar word-soup ("you too
+    # love [unk]") and fired the chorus. With require_pair, love-family
+    # triggers only validate when the honest transcript contains a love-word
+    # IMMEDIATELY followed by an addressee token (you/u/ya/yeah/yew + any
+    # anchor_extra name like sandy) or a slang token (ily). Real wake phrases
+    # always transcribe with that adjacency, so recall is unaffected.
+    # Monster/jetson buckets still validate on their own anchor word.
+    # Set false to revert to any-anchor behaviour.
+    require_pair: true
 
 # Porcupine
 porcupine:
@@ -234,7 +453,7 @@ enhancement:
   hum_q: 30
   # Denoise: 0 = off, 1.0 = standard, up to 2.0 for noisy rooms.
   # Aggressive values produce "musical noise" artifacts; bump cautiously.
-  denoise_strength: 1.0
+  denoise_strength: 1.4
   # Target RMS for loudness normalization (0.10 = ~-20 dBFS).
   # Layered clips balance because they're all hitting this level.
   target_rms: 0.10

@@ -205,6 +205,11 @@ class PhraseBucket:
     # Extra word-start anchors required to "be present" in addition to the
     # universal love-anchor. Empty = bucket has no extra-word requirement.
     anchor_extra: list[str] = field(default_factory=list)
+    # Per-bucket REQUIRED-anchor words. When set, these REPLACE the universal
+    # love-anchor for this bucket — used by non-love buckets like "i am a
+    # monster" so they aren't gated on love-words being present, and so the
+    # love buckets aren't accidentally triggered by their anchors.
+    anchor_words: list[str] = field(default_factory=list)
     # Free-form metadata passed through to the response layer
     metadata: dict = field(default_factory=dict)
 
@@ -212,6 +217,7 @@ class PhraseBucket:
     _patterns_phonetic: list[tuple[str, str]] = field(default_factory=list, repr=False)
     _slang_phonetic: list[tuple[str, str]] = field(default_factory=list, repr=False)
     _anchor_extra_re: re.Pattern | None = field(default=None, repr=False)
+    _anchor_words_re: re.Pattern | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -228,6 +234,15 @@ class PhraseHit:
 _LOVE_ANCHOR_RE = re.compile(
     r"(?:\b(?:lov|luv)[a-z]*\b)|(?:\bily\b)|(?:\biluvu\b)|(?:\biloveyou\b)"
 )
+
+# Strict validation vocabulary (used by validate_bucket_in_transcript).
+# A single love-prefixed word is NOT enough for honest-transcript validation
+# — conversational speech is full of "I'd love to", "lovely", "the love of".
+# We require the love-word to be IMMEDIATELY followed by an addressee token,
+# which is how every real wake phrase transcribes ("love you", "love ya").
+_LOVE_TOKEN_RE = re.compile(r"^(?:lov|luv)[a-z]*$")
+_SLANG_TOKENS = {"ily", "iluvu", "iloveyou"}
+_LOVE_COMPANIONS = {"you", "u", "ya", "yah", "yeah", "yew", "ye"}
 
 
 def _default_buckets() -> list[PhraseBucket]:
@@ -271,8 +286,10 @@ def buckets_from_config(cfg: dict) -> list[PhraseBucket]:
             slang=[s.lower() for s in raw.get("slang", []) if s],
             priority=int(raw.get("priority", 0)),
             anchor_extra=[a.lower() for a in raw.get("anchor_extra", []) if a],
+            anchor_words=[a.lower() for a in raw.get("anchor_words", []) if a],
             metadata={k: v for k, v in raw.items()
-                       if k not in ("id", "patterns", "slang", "priority", "anchor_extra")},
+                       if k not in ("id", "patterns", "slang", "priority",
+                                     "anchor_extra", "anchor_words")},
         ))
     return out
 
@@ -292,6 +309,12 @@ class PhraseMatcher:
         self._compile_buckets()
 
     def _compile_buckets(self):
+        # Addressee tokens accepted right after a love-word in honest-
+        # transcript validation: the base set plus every named recipient
+        # (anchor_extra), so "i love sandy" validates.
+        self._love_companions = set(_LOVE_COMPANIONS)
+        for b in self.buckets:
+            self._love_companions.update(b.anchor_extra)
         for b in self.buckets:
             b._patterns_phonetic = [(p, phonetic_phrase(p)) for p in b.patterns]
             b._slang_phonetic = [(s, metaphone(s)) for s in b.slang]
@@ -301,6 +324,11 @@ class PhraseMatcher:
                 b._anchor_extra_re = re.compile(pat)
             else:
                 b._anchor_extra_re = None
+            if b.anchor_words:
+                pat = r"|".join(rf"\b{re.escape(a)}[a-z]*\b" for a in b.anchor_words)
+                b._anchor_words_re = re.compile(pat)
+            else:
+                b._anchor_words_re = None
 
     # --- public ----------------------------------------------------------
 
@@ -309,13 +337,24 @@ class PhraseMatcher:
             return None
         text = text.lower().strip()
 
-        # Universal love-anchor — required for phonetic/Levenshtein passes.
+        # Universal love-anchor — required for phonetic/Levenshtein passes
+        # in love-family buckets. Buckets that declare their own anchor_words
+        # (e.g. monster) opt out of this and use their own anchor instead.
         has_love_anchor = bool(_LOVE_ANCHOR_RE.search(text))
 
         # Buckets are sorted by priority. Walk in order — first hit wins.
         for b in self.buckets:
             if b._anchor_extra_re is not None and not b._anchor_extra_re.search(text):
                 continue   # bucket requires an extra word that isn't present
+
+            # Per-bucket required anchor REPLACES the love-anchor for buckets
+            # that declare it (e.g. "monster"). Without this gate, the monster
+            # bucket would still need "love" in the transcript via the global
+            # anchor below, and it would never fire.
+            if b._anchor_words_re is not None:
+                bucket_anchor_present = bool(b._anchor_words_re.search(text))
+            else:
+                bucket_anchor_present = has_love_anchor
 
             # 1. Exact substring with word boundaries (most reliable signal)
             for v in b.patterns:
@@ -339,8 +378,8 @@ class PhraseMatcher:
                 return PhraseHit(b.id, b.patterns[0] if b.patterns else b.id,
                                   0.90, "name_anchor")
 
-            # 3. Phonetic substring — only if love-anchor is present.
-            if not has_love_anchor:
+            # 3. Phonetic substring — only if the bucket's anchor is present.
+            if not bucket_anchor_present:
                 continue
 
             text_phonetic = phonetic_phrase(text)
@@ -375,13 +414,88 @@ class PhraseMatcher:
         return None
 
     def quick_contains_love(self, text: str) -> bool:
-        """Cheap pre-filter for streaming partials."""
+        """Cheap pre-filter for streaming partials. Backward-compatible name —
+        only checks the love-anchor. Use quick_contains_any_anchor() to also
+        match buckets that declare their own anchor_words (e.g. monster)."""
         if not text:
             return False
         return _LOVE_ANCHOR_RE.search(text.lower()) is not None
+
+    def quick_contains_any_anchor(self, text: str) -> bool:
+        """Pre-filter that accepts the love-anchor OR any bucket-defined
+        anchor_words. The Vosk detector calls this on every partial result;
+        skipping the matcher when nothing of interest is in the transcript
+        keeps the hot path cheap."""
+        if not text:
+            return False
+        t = text.lower()
+        if _LOVE_ANCHOR_RE.search(t):
+            return True
+        for b in self.buckets:
+            if b._anchor_words_re is not None and b._anchor_words_re.search(t):
+                return True
+        return False
+
+    def validate_bucket_in_transcript(self, text: str, bucket_id: str) -> bool:
+        """Strict honest-transcript check used for cross-validation.
+
+        `text` is the UNBIASED full-vocab transcript; `bucket_id` is the
+        bucket the grammar recognizer wants to fire. Rules:
+
+          - Buckets with their own anchor_words (monster, jetson commands):
+            the anchor word must appear in the honest transcript — same as
+            the old behaviour.
+          - Love-family buckets: a love-word alone is not enough (kills
+            "I'd love to…" / "lovely" false-validations). Require a
+            love-word immediately followed by an addressee token
+            ("you"/"u"/"ya"/… or any bucket's anchor_extra name, so
+            "i love sandy" still validates), or a slang token.
+
+        Grammar mode is still allowed to disambiguate WHICH bucket (e.g. it
+        hears "sandy" where full-vocab doesn't) — we only insist the love
+        phrase itself shows up honestly."""
+        if not text:
+            return False
+        t = text.lower()
+        b = self.get_bucket(bucket_id)
+        if b is not None and b._anchor_words_re is not None:
+            return bool(b._anchor_words_re.search(t))
+        return self.contains_love_pair(t)
+
+    def contains_love_pair(self, text: str) -> bool:
+        """True if the text contains a love-word directly followed by an
+        addressee token, or a slang token. See validate_bucket_in_transcript."""
+        tokens = re.findall(r"[a-z']+", text.lower())
+        for i, tok in enumerate(tokens):
+            if tok in _SLANG_TOKENS:
+                return True
+            if _LOVE_TOKEN_RE.match(tok) and i + 1 < len(tokens) \
+                    and tokens[i + 1] in self._love_companions:
+                return True
+        return False
 
     def get_bucket(self, bucket_id: str) -> PhraseBucket | None:
         for b in self.buckets:
             if b.id == bucket_id:
                 return b
         return None
+
+    def isolated_bucket_ids(self) -> set[str]:
+        """Bucket ids whose clips must NEVER bleed into the default 'ily'
+        catch-all pool. A bucket is isolated when:
+
+          - it declares its own anchor_words (e.g. monster: distinct
+            semantic space, anchored on a different word), OR
+          - it's response_files_only (e.g. ily_sandy: curated playback
+            from a private fallback dir; any captured user clips stay
+            private to the bucket and are never layered into ily).
+
+        Auto-extends as new isolated buckets are added — no pipeline
+        changes needed."""
+        out: set[str] = set()
+        for b in self.buckets:
+            if b.anchor_words:
+                out.add(b.id)
+            elif b.metadata.get("response_files_only", False):
+                out.add(b.id)
+        return out
