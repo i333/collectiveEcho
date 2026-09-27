@@ -64,6 +64,8 @@ class PipelineContext:
     # identifier is wired and the clip survives the quality gate.
     speaker_id: str = ""
     speaker_embedding: list = field(default_factory=list)
+    # Arrival order among chorus triggers; 0 = not registered (commands).
+    seq: int = 0
 
 
 class TriggerPipeline:
@@ -100,6 +102,8 @@ class TriggerPipeline:
         # variety; lower = tighter emotional match.
         self.emotion_pool_size = ec.get("pool_size", 16)
 
+        self._init_freshness(cfg)
+
         # Sleep state — "jetson sleep" pauses all trigger handling except
         # the wake command; "jetson wake up" resumes. In-memory ON PURPOSE:
         # a reboot always comes back awake (the required boot default).
@@ -117,6 +121,22 @@ class TriggerPipeline:
         self._save_count = 0
         self._reject_reasons: dict[str, int] = {}
         self._log_every = 10
+
+    def _init_freshness(self, cfg):
+        pb = cfg.get("playback", {})
+        # Anything (speaker, take, fallback file) played within this window
+        # goes to the back of the line for the random picks. Soft: when the
+        # pool is too small, the least-recently-played fill the gap.
+        self.replay_cooldown_sec = pb.get("replay_cooldown_sec", 120.0)
+        # A random-slot speaker may play any take within this score margin
+        # of their best, rotating instead of always the single best take.
+        self.take_quality_margin = pb.get("take_quality_margin", 0.1)
+        # How long a quick re-trigger waits for the previous trigger's clip
+        # to finish saving, so the visitor can hear their own take.
+        self.wait_for_previous_save_sec = pb.get("wait_for_previous_save_sec", 1.5)
+        self._save_cv = threading.Condition()
+        self._run_seq = 0
+        self._unsaved: set[int] = set()
 
     # ------------------------------------------------------------------
     # Public entry
@@ -145,6 +165,11 @@ class TriggerPipeline:
             ctx.mood = self.mood_keeper.current()
             self.mood_keeper.record_trigger()
 
+        with self._save_cv:
+            self._run_seq += 1
+            ctx.seq = self._run_seq
+            self._unsaved.add(ctx.seq)
+
         try:
             self._stage_snapshot(ctx)
             self._stage_wake(ctx)
@@ -161,7 +186,43 @@ class TriggerPipeline:
             self._stage_respond_late(ctx)
             self._stage_save(ctx)
         finally:
+            # Before fadeout (which can sleep ~3s): a waiting re-trigger
+            # only needs the save, not the lights.
+            self._release_save_slot(ctx)
             self._stage_fadeout(ctx)
+
+    def _release_save_slot(self, ctx: PipelineContext):
+        """This trigger's clip is saved (or never will be) — unblock any
+        later trigger waiting in _wait_for_earlier_saves."""
+        with self._save_cv:
+            self._unsaved.discard(ctx.seq)
+            self._save_cv.notify_all()
+
+    def _wait_for_earlier_saves(self, ctx: PipelineContext):
+        """A visitor who repeats the phrase right after the chorus re-triggers
+        while their previous take is still in capture/analysis, so it isn't
+        in memory yet and the promised "you hear yourself next time" misses.
+        Hold this response briefly until earlier triggers have saved; only
+        ever waits in that race, never on an idle mirror."""
+        timeout = self.wait_for_previous_save_sec
+        if timeout <= 0:
+            return
+
+        def earlier_pending():
+            return any(s < ctx.seq for s in self._unsaved)
+
+        with self._save_cv:
+            if not earlier_pending():
+                return
+            t0 = time.monotonic()
+            done = self._save_cv.wait_for(lambda: not earlier_pending(), timeout)
+        waited = time.monotonic() - t0
+        if done:
+            logger.info("Held response %.2fs for the previous trigger's clip to save",
+                         waited)
+        else:
+            logger.info("Previous trigger still processing after %.1fs — responding "
+                         "without its clip", waited)
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -300,24 +361,27 @@ class TriggerPipeline:
         bucket_meta = self._bucket_metadata(ctx.phrase_type)
         response_files_only = bucket_meta.get("response_files_only", False)
 
-        has_existing = self.memory.has_live_clips() or (
-            self.mode in ("fallback", "hybrid") and self.memory.get_fallback_clips(ctx.phrase_type)
-        )
         if response_files_only:
-            # Only use this bucket's fallback files. No layering, single random pick.
+            # Only use this bucket's fallback files. No layering, single pick,
+            # never the file that just played.
             fb = self.memory.get_fallback_clips(ctx.phrase_type)
             if not fb:
                 logger.warning("Bucket %s is response_files_only but has no fallbacks", ctx.phrase_type)
                 return
-            pick = random.choice(fb)
+            pick = self._fresh_first(fb, self.memory.last_played)[0]
             ctx.responded_early = True
             ctx.response_paths = [pick]
             logger.info("Response (early, %s files-only): SINGLE → %s", ctx.phrase_type, pick)
             self.wled.intimate()
             self._react_and_play_file(pick, valence=0.0, arousal=0.5)
+            self.memory.mark_played(ctx.response_paths)
             self._spawn_signal_ready(ctx)
             return
 
+        self._wait_for_earlier_saves(ctx)
+        has_existing = self.memory.has_live_clips() or (
+            self.mode in ("fallback", "hybrid") and self.memory.get_fallback_clips(ctx.phrase_type)
+        )
         if not has_existing:
             return
 
@@ -344,7 +408,7 @@ class TriggerPipeline:
             if pinned_paths:
                 pick = pinned_paths[0]
             elif fallback_paths:
-                pick = random.choice(fallback_paths)
+                pick = self._fresh_first(fallback_paths, self.memory.last_played)[0]
             else:
                 pick = live_entries[-1].path  # last resort: newest live
             logger.info("Response (early): SINGLE → %s", pick)
@@ -354,9 +418,9 @@ class TriggerPipeline:
         else:
             # Speaker-dedup chorus:
             #   - First `recent_n` slots: most-recent DISTINCT speakers,
-            #     deterministic. Per speaker we play their best-quality clip.
-            #   - Next `random_n` slots: uniform random sample of OTHER
-            #     distinct speakers; again best-quality per speaker.
+            #     deterministic. Per speaker we play their newest clip.
+            #   - Next `random_n` slots: random sample of OTHER distinct
+            #     speakers, recently-heard ones last; one of their top takes.
             #   - Fallbacks top-up only if live speakers can't fill the budget.
             # See _build_layered_picks for the full rule.
             recent_n = self.cfg["playback"].get("layered_recent_count", 3)
@@ -390,10 +454,11 @@ class TriggerPipeline:
             else:
                 logger.info(
                     "Response (early): LAYERED %d clips [%d pinned-recent + %d random "
-                    "from %d distinct speakers, dropped %d below min_q=%.2f, "
-                    "centroid-dedup rejected %d (cos≥%.2f)]: %s",
+                    "from %d distinct speakers, %d random replayed within %.0fs, "
+                    "dropped %d below min_q=%.2f, centroid-dedup rejected %d (cos≥%.2f)]: %s",
                     len(clips), info["pinned_count"], info["sampled_count"],
-                    info["distinct_speakers"], info["dropped_low_q"], min_q,
+                    info["distinct_speakers"], info["replayed"], self.replay_cooldown_sec,
+                    info["dropped_low_q"], min_q,
                     info["embedding_rejects"], dedup_thr,
                     [p.split("/")[-1] for p in kept_paths])
                 self.wled.layered()
@@ -601,9 +666,10 @@ class TriggerPipeline:
             speaker_id=ctx.speaker_id,
             speaker_embedding=ctx.speaker_embedding,
         )
-        logger.info("Clip SAVED [%s] → %s (score=%.2f, emo=%s, spk=%s)",
+        logger.info("Clip SAVED [%s] → %s (score=%.2f, emo=%s, spk=%s, %.1fs after trigger)",
                      ctx.phrase_type, ctx.clip_path, r.score, e.label,
-                     ctx.speaker_id or "?")
+                     ctx.speaker_id or "?",
+                     (datetime.now() - ctx.trigger_time).total_seconds())
         self._record_save(ctx.phrase_type)
 
     def _record_save(self, phrase_type: str):
@@ -757,9 +823,11 @@ class TriggerPipeline:
 
         logger.info(
             "Layered picks: %d clips [%d pinned-recent + %d random from %d distinct "
-            "speakers, dropped %d below min_q=%.2f, centroid-dedup rejected %d (cos≥%.2f)]: %s",
+            "speakers, %d random replayed within %.0fs, dropped %d below min_q=%.2f, "
+            "centroid-dedup rejected %d (cos≥%.2f)]: %s",
             len(chosen_paths), info["pinned_count"], info["sampled_count"],
-            info["distinct_speakers"], info["dropped_low_q"], min_q,
+            info["distinct_speakers"], info["replayed"], self.replay_cooldown_sec,
+            info["dropped_low_q"], min_q,
             info["embedding_rejects"], dedup_thr,
             [p.split("/")[-1] for p in chosen_paths])
 
@@ -779,7 +847,9 @@ class TriggerPipeline:
         # monster trigger and vice versa.
         fb = self.memory.get_fallback_clips(ctx.phrase_type)
         if fb:
-            self.playback.play_file(random.choice(fb))
+            pick = self._fresh_first(fb, self.memory.last_played)[0]
+            self.playback.play_file(pick)
+            self.memory.mark_played([pick])
             self._spawn_signal_ready(ctx)
 
     # ------------------------------------------------------------------
@@ -846,10 +916,13 @@ class TriggerPipeline:
             their NEWEST clip (it already cleared the save-threshold gate,
             so freshness wins). The pinned set ignores ``min_q``.
           - ``sampled_paths`` are up to ``random_n`` additional speakers,
-            uniformly sampled WITHOUT replacement from every other speaker
-            in the pool (anyone not already pinned). Per sampled speaker we
-            play their HIGHEST-QUALITY clip so the random tail sounds as
-            polished as possible.
+            sampled WITHOUT replacement from every other speaker in the pool
+            (anyone not already pinned). Speakers heard within
+            ``replay_cooldown_sec`` go to the back of the line (see
+            _fresh_first), so back-to-back triggers bring different voices.
+            Per sampled speaker we play one of their top takes (within
+            ``take_quality_margin`` of their best), rotating so a speaker
+            with several good takes doesn't always replay the same one.
 
         Total layer count is capped at ``max_layers`` and at the number of
         distinct speakers + fallbacks available. Fallback paths are only
@@ -859,9 +932,9 @@ class TriggerPipeline:
         speakers (one slot each) so they don't all collapse into a single
         chorus position before backfill completes.
         """
-        # 1. Group live entries by speaker. For each speaker, remember BOTH
-        #    their newest clip (for pinned slots) and their best-quality
-        #    clip (for random slots) so we don't have to re-scan later.
+        # 1. Group live entries by speaker. For each speaker, remember their
+        #    newest clip (pinned slots), best-quality clip (min_q gate) and
+        #    all takes (random slots rotate among the top ones).
         by_sid: dict[str, list[ClipEntry]] = {}
         nospk: list[ClipEntry] = []
         for c in live_entries:
@@ -872,13 +945,26 @@ class TriggerPipeline:
 
         # speakers: (newest_ts, newest_clip, best_clip, sid)
         speakers: list[tuple[str, ClipEntry, ClipEntry, str]] = []
+        takes_by_sid: dict[str, list[ClipEntry]] = {}
         for sid, clips in by_sid.items():
             newest = max(clips, key=lambda c: c.timestamp)
             best = max(clips, key=lambda c: (c.score or 0.0, c.timestamp))
             speakers.append((newest.timestamp, newest, best, sid))
+            takes_by_sid[sid] = clips
         # Un-clustered clips each stand alone — newest == best == the clip.
         for i, c in enumerate(nospk):
-            speakers.append((c.timestamp, c, c, f"__nospk_{i}_{c.path}"))
+            sid = f"__nospk_{i}_{c.path}"
+            speakers.append((c.timestamp, c, c, sid))
+            takes_by_sid[sid] = [c]
+
+        # When each speaker was last heard (any of their takes).
+        now = time.time()
+        spk_played = {sid: max(c.last_played_ts for c in takes)
+                      for sid, takes in takes_by_sid.items()}
+        replayed = 0
+
+        def _recently_heard(sid: str) -> bool:
+            return now - spk_played[sid] < self.replay_cooldown_sec
 
         # 2. Sort speakers newest-first and apply selection with embedding
         #    dedup as a runtime safety net. Even when speaker_id clustering
@@ -965,20 +1051,25 @@ class TriggerPipeline:
         layers_budget = max(0, max_layers - len(pinned_clips))
         random_budget = min(random_n, layers_budget)
         sampled_clips: list[ClipEntry] = []
+        sampled_sids: set[str] = set()
         if random_budget > 0 and qualified_rest:
-            # Shuffle the qualified pool, then greedily accept up to the
-            # budget while honoring the embedding dedup. The shuffle keeps
-            # selection random; the filter keeps the chorus diverse.
-            candidates = list(qualified_rest)
-            random.shuffle(candidates)
+            # Fresh-first shuffle of the qualified pool, then greedily accept
+            # up to the budget while honoring the embedding dedup. The
+            # shuffle keeps selection random; the filter keeps the chorus
+            # diverse.
+            candidates = self._fresh_first(
+                qualified_rest, lambda e: spk_played[e[3]], now)
             for entry in candidates:
                 if len(sampled_clips) >= random_budget:
                     break
-                _, _, best_clip, sid = entry
-                if _too_similar(best_clip, sid):
+                sid = entry[3]
+                take = self._pick_take(takes_by_sid[sid], min_q, now)
+                if _too_similar(take, sid):
                     continue
-                _accept(best_clip, sid)
-                sampled_clips.append(best_clip)
+                _accept(take, sid)
+                sampled_clips.append(take)
+                sampled_sids.add(sid)
+                replayed += _recently_heard(sid)
 
         # 2c. Underfill relaxation — if strict dedup left the chorus
         #     unexpectedly thin (e.g. the bucket only has a few
@@ -993,21 +1084,20 @@ class TriggerPipeline:
         if (current < target and chorus_dedup_threshold > 0
                 and (excluded_sids or qualified_rest)):
             relaxed = min(chorus_dedup_threshold * 1.5, 0.7)
-            already_used = {c.path for c in pinned_clips} | {c.path for c in sampled_clips}
             # Reconsider everything we passed over — pinned-excluded plus
             # any qualified random candidates that lost the dedup race.
             second_pass = [e for e in speakers
                            if e[3] not in pinned_sid_set
-                           and e[2].path not in already_used
-                           and e[1].path not in already_used]
-            random.shuffle(second_pass)
+                           and e[3] not in sampled_sids]
+            second_pass = self._fresh_first(
+                second_pass, lambda e: spk_played[e[3]], now)
             for entry in second_pass:
                 if len(pinned_clips) + len(sampled_clips) >= target:
                     break
                 ts, newest_clip, best_clip, sid = entry
                 if (newest_clip.score or 0.0) < min_q and (best_clip.score or 0.0) < min_q:
                     continue
-                cand_clip = best_clip if (best_clip.score or 0.0) >= (newest_clip.score or 0.0) else newest_clip
+                cand_clip = self._pick_take(takes_by_sid[sid], min_q, now)
                 # Reuse _too_similar but with the temporarily-relaxed threshold.
                 orig_thr = chorus_dedup_threshold
                 # Inline check at relaxed threshold (don't mutate closure state).
@@ -1023,6 +1113,8 @@ class TriggerPipeline:
                     continue
                 _accept(cand_clip, sid)
                 sampled_clips.append(cand_clip)
+                sampled_sids.add(sid)
+                replayed += _recently_heard(sid)
                 relax_filled += 1
 
         # ``layer_clips`` treats the LAST element as loudest/centered, so we
@@ -1035,20 +1127,49 @@ class TriggerPipeline:
         remaining = (recent_n + random_n) - len(pinned_paths) - len(sampled_paths)
         remaining = min(remaining, max_layers - len(pinned_paths) - len(sampled_paths))
         if remaining > 0 and fallback_paths:
-            fb = list(fallback_paths)
-            random.shuffle(fb)
+            fb = self._fresh_first(fallback_paths, self.memory.last_played, now)
             sampled_paths.extend(fb[:remaining])
 
         info = {
             "distinct_speakers": len(speakers),
             "pinned_count": len(pinned_paths),
             "sampled_count": len(sampled_paths),
+            "replayed": replayed,
             "dropped_low_q": dropped_low_q,
             "embedding_rejects": embedding_rejects,
             "relax_filled": relax_filled,
             "pinned_sids": pinned_sids,
         }
         return pinned_paths, sampled_paths, info
+
+    def _fresh_first(self, items: list, last_played, now: float | None = None) -> list:
+        """Random order, except anything played within replay_cooldown_sec
+        goes to the back — least recently played first among those. With a
+        big pool nothing from the last few triggers repeats; with a small one
+        it rotates through everyone instead of repeating at random.
+        ``last_played(item)`` returns epoch seconds, 0 if never played."""
+        if now is None:
+            now = time.time()
+        fresh, stale = [], []
+        for it in items:
+            ts = last_played(it)
+            if now - ts < self.replay_cooldown_sec:
+                stale.append((ts, it))
+            else:
+                fresh.append(it)
+        random.shuffle(fresh)
+        random.shuffle(stale)
+        stale.sort(key=lambda x: x[0])  # stable sort keeps ties shuffled
+        return fresh + [it for _, it in stale]
+
+    def _pick_take(self, takes: list[ClipEntry], min_q: float, now: float) -> ClipEntry:
+        """One take for a random-slot speaker: any take within
+        take_quality_margin of their best (and at least min_q), preferring
+        one that hasn't played recently."""
+        best = max((c.score or 0.0) for c in takes)
+        floor = max(min_q, best - self.take_quality_margin)
+        eligible = [c for c in takes if (c.score or 0.0) >= floor] or takes
+        return self._fresh_first(eligible, lambda c: c.last_played_ts, now)[0]
 
     def _weighted_sample(self, items: list, weights: list[float], k: int) -> list:
         """Weighted sample without replacement (Efraimidis-Spirakis). Each
@@ -1097,7 +1218,7 @@ class TriggerPipeline:
                 phrase_type=bucket_filter,
             )
             if pool:
-                return random.choice(pool).path
+                return self._fresh_first(pool, lambda c: c.last_played_ts)[0].path
         if self.memory.has_live_clips():
             # Random recent clip — must respect bucket isolation. For an
             # isolated bucket (monster, ...) only its own clips count; for
@@ -1109,10 +1230,10 @@ class TriggerPipeline:
             else:
                 recent = [c for c in recent if c.phrase_type not in isolated]
             if recent:
-                return random.choice(recent).path
+                return self._fresh_first(recent, lambda c: c.last_played_ts)[0].path
         fb = self.memory.get_fallback_clips(bucket)
         if fb:
-            return random.choice(fb)
+            return self._fresh_first(fb, self.memory.last_played)[0]
         return None
 
     def _react_and_play_file(self, path: str, valence: float, arousal: float,

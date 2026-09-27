@@ -458,3 +458,80 @@ DeepFilterNet 2 as a deeper upgrade is queued for after the GPU stack lands.
 - **Speaker embeddings (ECAPA-TDNN)** + **diarization** — deferred from earlier scoping. Can layer on after the V2 base is validated.
 - **WLED palette presets per emotion period** — design 4–6 palettes (intimate/warm/cool/excited/melancholic) and have `WLEDRealtime` cross-fade between them as `(valence, arousal)` drifts during playback.
 
+
+---
+
+## Session: 2026-09-27 — tighter chorus layering + response freshness audit
+
+### 1. Voices weren't layered — they queued
+
+Layer start times grew by the golden ratio *exponentially* (`0.28 × 1.618^(n-1)`),
+so with 8 voices the last one entered at 5.0s. Trimmed clips are ~1.1s, so the
+back half of the chorus played one voice at a time. Measured on the 8 real
+trimmed clips in `audio/live/i_love_you/`:
+
+| | before | after |
+|---|---|---|
+| last voice enters | 5.02s | 1.69s |
+| voices sounding together (mean) | 1.66 | 3.02 |
+| time with a lone voice | 63% | 18% |
+| time with ≥4 voices | 9% | 47% |
+| chorus length | 6.2s | 2.9s |
+
+Changes (`modules/effects.py`, `playback.*` in config.yaml):
+- **`layer_spacing: golden_gaps`** (new default, `effects.layer_onsets`): every gap
+  is `layer_gap_sec` (0.16s) or ×1.618 (0.26s), arranged as a golden-ratio
+  Sturmian (Fibonacci-word) sequence — never mechanical, never two short gaps
+  in a row, newest voice always gets a long lead-in. Random phase + 0–15%
+  `layer_gap_jitter` per trigger. Tightest gap ≈0.17s = the tightest gap the old
+  tuning already used without phrases crashing. `layer_spacing: phi_growth`
+  restores the old onsets exactly for A/B.
+- **`pan_width: 0.6`** with graduated positions (±0.15, ±0.3, ±0.45, ±0.6).
+  Previously five of eight voices sat at ±0.9.
+- **Bug:** per-layer fade-in and transient softening ran *after* the delay was
+  prepended, so they ramped silence and every delayed voice entered with a hard
+  edge. Fades now run before the delay.
+- Mood `pace` scales `layer_gap_sec` the same way it scaled `layer_delay_sec`.
+
+### 2. Freshness audit — the chorus repeated itself more than intended
+
+Findings:
+- `last_played_ts` was written on every playback but **never read**. The 30s
+  recently-played exclusion described in the 2026-05-14 notes was lost in the
+  speaker-dedup rewrite. Simulated visit (14 speakers, triggers 12s apart, no
+  new saves): **2.3 of the 5 random voices repeated from the previous trigger;
+  99% of triggers repeated at least one.**
+- Random-slot speakers always played their single best-scoring take, so a
+  speaker with 6 takes was always heard saying it exactly the same way.
+- Sandy (files-only), fallback and intimate picks used `random.choice` — with 3
+  Sandy recordings, the same one played twice in a row ~1/3 of the time.
+- **Race:** a visitor who repeats the phrase right after the chorus re-triggers
+  while their previous take is still in capture/analysis (estimated save ~2–3s
+  after the chorus ends: ≥1.4s post-capture + transcription; the detector
+  un-mutes 0.6s after it). The new trigger's chorus is
+  built before that save lands, so "you hear yourself next time" misses exactly
+  when the visitor is most engaged. Reproduced with stubbed IO.
+
+Changes (`modules/pipeline.py`, `modules/memory_store.py`):
+- **`replay_cooldown_sec: 120`** — speakers heard within the window go to the
+  back of the random pool; when the pool is too small, least-recently-heard fill
+  in (logged as `N random replayed within 120s`). Simulated repeat rate: 2.3 → 0.
+  Also applied to single-file picks (Sandy never repeats back-to-back, fallback
+  top-ups rotate). Fallback play times are tracked in memory (not persisted).
+- **`take_quality_margin: 0.1`** — random-slot speakers rotate among takes
+  within 0.1 of their best score. 6-take speaker: 1.0 → 2.65 distinct takes per
+  6-trigger visit. Pinned slots still play the newest take.
+- **`wait_for_previous_save_sec: 1.5`** — a trigger that arrives while an
+  earlier one hasn't saved yet holds its response up to 1.5s for it. Never waits
+  on an idle mirror. Logs `Held response …` / `Previous trigger still
+  processing …`; `Clip SAVED` now logs seconds-after-trigger so the race is
+  visible on hardware. Set 0 to disable if the held response feels slow.
+
+### To check on the hardware
+- Listen: does 0.16 feel close without the front phrases crashing? Knob is
+  `layer_gap_sec` (0.18–0.20 = more air). A/B with `layer_spacing: phi_growth`.
+- The denser mix reaches `layer_mix_target_rms` without the peak clamp (crest
+  factor drops as voices overlap) — watch `Output peak=` for limiter load.
+- If `random replayed` is often > 0, the pool of distinct speakers is smaller
+  than `layered_random_count` needs — check `distinct speakers` in the same log
+  line; `chorus_dedup_threshold: 0.30` may be merging different visitors.

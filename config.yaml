@@ -278,14 +278,34 @@ playback:
   #                         play their NEWEST clip — it already cleared the
   #                         save-threshold quality gate.
   #   layered_random_count: how many additional distinct speakers are
-  #                         uniformly sampled from the rest of the bucket.
-  #                         For each random speaker we play their HIGHEST-
-  #                         QUALITY clip so the random tail stays polished.
+  #                         randomly sampled from the rest of the bucket
+  #                         (recently-heard last — replay_cooldown_sec).
+  #                         For each random speaker we play one of their
+  #                         top takes (take_quality_margin) so the random
+  #                         tail stays polished without always replaying
+  #                         the same recording.
   #                         Combined with recent_count this defines the
   #                         target chorus size — fallback clips top up only
   #                         if the live pool can't reach that many speakers.
   layered_recent_count: 3
   layered_random_count: 5
+  # Freshness of the RANDOM part of the chorus (pinned-recent slots are
+  # unaffected). Any speaker heard within this many seconds goes to the
+  # back of the line, so a visitor repeating the phrase hears new voices
+  # each time instead of ~half the same ones. Soft: if the pool is too
+  # small, the least-recently-heard fill in (logged as "replayed"). Also
+  # keeps single-file responses (Sandy, fallbacks) from repeating the file
+  # that just played. 0 = plain uniform random.
+  replay_cooldown_sec: 120
+  # A random-slot speaker plays any of their takes scoring within this
+  # margin of their best, rotating between them — instead of always the one
+  # best take. 0 = best take(s) only.
+  take_quality_margin: 0.1
+  # A visitor who repeats the phrase right after the chorus re-triggers
+  # while their previous take is still being captured/analyzed, so it's not
+  # in memory yet and they don't hear themselves. Hold the response up to
+  # this long for the in-flight save. Only waits in that race; 0 disables.
+  wait_for_previous_save_sec: 1.5
   # Speakers whose best-quality clip falls below `layered_min_quality` are
   # dropped from the RANDOM pool (pinned slots ignore this — those
   # contributors earned their spot via the save_threshold gate). Save bar

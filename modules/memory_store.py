@@ -73,6 +73,9 @@ class MemoryStore:
         self.evict_weight_age = mem.get("evict_weight_age", 0.20)
 
         self.clips: list[ClipEntry] = []
+        # last-played epoch per fallback file. Fallbacks aren't ClipEntries,
+        # so this is in-memory only — a restart simply forgets it.
+        self._fallback_played: dict[str, float] = {}
         # Threshold the on-disk speaker_ids were clustered with. Used by
         # backfill_speakers() to auto-recluster after a config change.
         self.clustering_threshold: float | None = None
@@ -617,9 +620,20 @@ class MemoryStore:
         for c in self.clips:
             if c.path in path_set:
                 c.last_played_ts = now
+                path_set.discard(c.path)
                 changed = True
+        # Whatever is left isn't a live clip — a fallback file.
+        for p in path_set:
+            self._fallback_played[p] = now
         if changed:
             self._save_state()
+
+    def last_played(self, path: str) -> float:
+        """Epoch seconds this clip or fallback file last played; 0 if never."""
+        for c in self.clips:
+            if c.path == path:
+                return c.last_played_ts
+        return self._fallback_played.get(path, 0.0)
 
 
 # ----------------------------------------------------------------------
