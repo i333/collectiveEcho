@@ -304,16 +304,39 @@ playback:
   # of the "probably same speaker" cases without false-merging distinct
   # voices. Set to 0 to disable.
   chorus_dedup_threshold: 0.30
-  # Base delay between chorus layers, grown by the golden ratio per layer
-  # (delay_n = base * PHI^(age-1)). Tuning history:
+  # How chorus layer start times are spaced (see effects.layer_onsets).
+  #   golden_gaps — every gap is either layer_gap_sec (short) or
+  #                 layer_gap_sec×1.618 (long), in a non-repeating golden-
+  #                 ratio pattern that never puts two short gaps together.
+  #                 Spread grows linearly, so all voices stack up on each
+  #                 other: with 8 layers the last voice enters at ~1.7s
+  #                 and ~3 voices sound at once on average.
+  #   phi_growth  — legacy: start_n = layer_delay_sec × 1.618^(n-1). Grows
+  #                 exponentially; with 8 layers the last voice entered at
+  #                 5.0s and 63% of the chorus was a single voice alone.
+  layer_spacing: golden_gaps
+  # golden_gaps: the SHORT gap between two layer starts — also the minimum
+  # spacing (before the time-of-day pace: ×0.9 morning … ×1.25 night).
+  # 0.16 keeps the tightest gap (~0.17s) at the tightest gap the old tuning
+  # already used without phrases crashing. Raise to 0.18–0.20 for more air
+  # between voices, lower for a denser crowd.
+  layer_gap_sec: 0.16
+  # golden_gaps: stretch each gap by a random 0–15% per trigger so the
+  # timing never sounds quantized. 0 = exact two-gap pattern.
+  layer_gap_jitter: 0.15
+  # phi_growth only. Tuning history:
   #   0.35 → 8th layer at 6.3s — too distant
   #   0.20 → 8th at 3.6s — but front gaps too tight (front phrases crash)
   #   0.28 → 8th at 5.0s — middle ground, PHI character preserved
   layer_delay_sec: 0.28
-  # Floor between consecutive layer starts (linear-style minimum). Set
-  # to 0 to use pure golden-ratio growth. 0.35 with base=0.20 produced
-  # a too-linear feel in the first 5 layers; pure PHI is more organic.
+  # phi_growth only: floor between consecutive layer starts. 0 = pure PHI.
   layer_min_gap_sec: 0.0
+  # Stereo width of the chorus: the oldest pair of voices sits at ±pan_width,
+  # younger pairs proportionally closer to center, newest dead center.
+  # Was effectively 0.9 with five of eight voices piled on the hard edges;
+  # 0.6 keeps some left/right separation while the crowd reads as one group.
+  # 0 = everything centered.
+  pan_width: 0.6
   # 0.65 → 0.78: with 12 layers, 0.65^11 ≈ 0.009 (oldest inaudible). 0.78^11
   # ≈ 0.07 — older voices stay perceivable in the chorus while newest still
   # leads. Drop back to 0.65-0.70 if the mix becomes muddy.

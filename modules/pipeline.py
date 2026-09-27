@@ -1167,6 +1167,7 @@ class TriggerPipeline:
         m = ctx.mood
         # Slower pace at night (deeper, more deliberate layering)
         cfg["layer_delay_sec"] = cfg.get("layer_delay_sec", 0.35) * m.pace
+        cfg["layer_gap_sec"] = cfg.get("layer_gap_sec", 0.16) * m.pace
         # More intimacy → less reverb mix (closer voices)
         if "reverb_decay" in cfg:
             cfg["reverb_decay"] = max(0.05, cfg["reverb_decay"] * (1.2 - 0.5 * m.intimacy))

@@ -7,6 +7,8 @@ Mono arrays are 1-D; stereo arrays are 2-D with shape (N, 2).
 """
 
 import logging
+import math
+import random
 
 import numpy as np
 
@@ -266,12 +268,75 @@ def reverb_tail(audio: np.ndarray, sample_rate: int,
     return out
 
 
+def layer_onsets(n: int, cfg_playback: dict, rng=None) -> list[float]:
+    """Start time (seconds) of each chorus layer, indexed by age (0 = newest).
+
+    "golden_gaps" (default): consecutive onsets are separated by one of two
+    gaps — `layer_gap_sec` (short) or `layer_gap_sec * PHI` (long) — arranged
+    as a golden-ratio Sturmian sequence (the Fibonacci-word pattern
+    L S L L S L S L L ...). The spacing never repeats mechanically, two short
+    gaps never touch (so no pile-up of onsets), and total spread grows only
+    linearly with layer count, so every voice overlaps several others. A
+    random phase picks a different stretch of the pattern each trigger, and
+    `layer_gap_jitter` stretches each gap by up to that fraction. The newest
+    voice always gets a long gap so it lands clearly before the crowd enters.
+
+    "phi_growth" (legacy): onset = layer_delay_sec * PHI^(age-1), floored by
+    layer_min_gap_sec. Grows exponentially — with 8 layers the last voice
+    starts ~5s after the first and plays alone.
+    """
+    if n <= 0:
+        return []
+    rng = rng or random
+    onsets = [0.0] * n
+    spacing = cfg_playback.get("layer_spacing", "golden_gaps")
+
+    if spacing == "phi_growth":
+        base = cfg_playback.get("layer_delay_sec", 0.10)
+        min_gap = cfg_playback.get("layer_min_gap_sec", 0.0)
+        for age in range(1, n):
+            onsets[age] = max(onsets[age - 1] + min_gap,
+                              base * (PHI ** (age - 1)))
+        return onsets
+
+    short_gap = cfg_playback.get("layer_gap_sec", 0.16)
+    jitter = max(0.0, cfg_playback.get("layer_gap_jitter", 0.0))
+    alpha = 1.0 / (PHI * PHI)  # share of short gaps (~38%)
+    phase = rng.random()
+    for age in range(1, n):
+        k = age - 1
+        is_short = (math.floor((k + 1) * alpha + phase)
+                    - math.floor(k * alpha + phase)) == 1
+        if age == 1:
+            is_short = False
+        gap = short_gap if is_short else short_gap * PHI
+        if jitter > 0:
+            # Stretch only — layer_gap_sec stays the hard minimum spacing.
+            gap *= 1.0 + rng.uniform(0.0, jitter)
+        onsets[age] = onsets[age - 1] + gap
+    return onsets
+
+
+def layer_pan(age: int, n: int, width: float) -> float:
+    """Stereo position for a layer. Newest is centered; older voices alternate
+    L/R (odd ages left) and widen in pairs until the oldest pair sits at
+    ±width. Graduated rather than saturating, so the back of the chorus is
+    spread across the image instead of piled up at the hard edges."""
+    if age <= 0 or n <= 1 or width <= 0:
+        return 0.0
+    pair = (age + 1) // 2
+    max_pair = max(1, n // 2)
+    amount = width * min(1.0, pair / max_pair)
+    return -amount if age % 2 == 1 else amount
+
+
 def layer_clips(clips: list[np.ndarray], sample_rate: int,
                 cfg_playback: dict) -> np.ndarray:
     """
     Layer multiple clips with spatial separation techniques:
-    - Golden-ratio delay offsets (natural, non-repeating spacing)
-    - Stereo panning (alternating L/R with increasing width)
+    - Golden-ratio onset spacing, bounded so every voice overlaps others
+      (see layer_onsets)
+    - Stereo panning (alternating L/R, graduated out to ±pan_width)
     - Pitch detuning (±7 cents, alternating sharp/flat)
     - Low-pass rolloff on older layers (simulates distance)
     - Softer volume decay (0.85) — EQ/panning create perceived distance
@@ -305,14 +370,7 @@ def layer_clips(clips: list[np.ndarray], sample_rate: int,
     predelay_newest_ms = cfg_playback.get("reverb_predelay_newest_ms", 50)
     predelay_oldest_ms = cfg_playback.get("reverb_predelay_oldest_ms", 10)
 
-    # Tuning parameters
-    base_delay_sec = cfg_playback.get("layer_delay_sec", 0.10)
-    # Minimum gap between consecutive layers — golden-ratio growth alone
-    # crowds the first few layers ("phrases crash at the start"). The
-    # floor enforces a perceptual minimum without changing the tail
-    # (PHI takes over once its delta exceeds the floor). Set to 0 to
-    # disable and revert to pure golden-ratio.
-    min_gap_sec = cfg_playback.get("layer_min_gap_sec", 0.0)
+    # Tuning parameters (onset spacing knobs are read by layer_onsets)
     volume_decay = cfg_playback.get("layer_volume_decay", 0.85)
     detune_cents = cfg_playback.get("detune_cents", 7.0)
     lp_oldest_hz = cfg_playback.get("lp_oldest_hz", 3500)
@@ -326,26 +384,15 @@ def layer_clips(clips: list[np.ndarray], sample_rate: int,
     layer_norm_target_rms = cfg_playback.get("layer_norm_target_rms", 0.10)
     layer_norm_max_gain = cfg_playback.get("layer_norm_max_gain", 3.0)
 
-    # Panning positions: center for newest, alternating L/R for older
-    # Layer 0 (newest) = 0.0 (center)
-    # Layer 1 = -0.30 (left), layer 2 = +0.30 (right)
-    # Layer 3 = -0.60, layer 4 = +0.60, etc.
-    pan_step = 0.30
-    max_pan = 0.90
+    # Widest stereo position (oldest pair). Narrower = voices sit closer
+    # together in one spot; 0 = everything centered.
+    pan_width = cfg_playback.get("pan_width", 0.9)
 
     fade_in_n = int(fade_in_sec * sample_rate)
     fade_out_n = int(fade_out_sec * sample_rate)
     soften_n = int(transient_soften_ms / 1000.0 * sample_rate)
 
-    # Precompute layer start times. age 0 = newest = 0s. Each subsequent
-    # layer = max(prev + min_gap, base * PHI^(age-1)). This floors the
-    # crowded early gaps without touching the tail (PHI catches up
-    # whenever its delta exceeds the floor).
-    delays_by_age = [0.0] * n
-    for age in range(1, n):
-        phi_delay = base_delay_sec * (PHI ** (age - 1))
-        delays_by_age[age] = max(delays_by_age[age - 1] + min_gap_sec,
-                                  phi_delay)
+    delays_by_age = layer_onsets(n, cfg_playback)
 
     processed = []
     for i, clip in enumerate(clips):
@@ -370,14 +417,8 @@ def layer_clips(clips: list[np.ndarray], sample_rate: int,
         # --- Convert to stereo for panning ---
         audio = mono_to_stereo(audio)
 
-        # --- Stereo panning ---
-        if age > 0:
-            pan_amount = min(pan_step * age, max_pan)
-            pan_sign = -1 if age % 2 == 1 else 1  # odd=left, even=right
-            audio = stereo_pan(audio, pan_sign * pan_amount)
-        else:
-            # Newest stays centered (stereo_pan at 0.0)
-            audio = stereo_pan(audio, 0.0)
+        # --- Stereo panning (newest centered) ---
+        audio = stereo_pan(audio, layer_pan(age, n, pan_width))
 
         # --- Low-pass rolloff: older = darker (simulates distance) ---
         if age > 0 and n > 1:
@@ -390,18 +431,20 @@ def layer_clips(clips: list[np.ndarray], sample_rate: int,
         vol = volume_decay ** age
         audio = apply_volume(audio, vol)
 
-        # --- Delay offsets (precomputed; see delays_by_age above) ---
-        if age > 0:
-            delay_samples = int(delays_by_age[age] * sample_rate)
-            audio = apply_delay(audio, delay_samples)
-
         # --- Transient softening on older layers ---
+        # Fades go on BEFORE the delay: applied after, they only ramped the
+        # prepended silence and every delayed layer entered with a hard edge.
         if age >= 2 and soften_n > 0:
             audio = fade_in(audio, soften_n)
 
         # --- Fades ---
         audio = fade_in(audio, fade_in_n)
         audio = fade_out(audio, fade_out_n)
+
+        # --- Delay offsets (precomputed; see delays_by_age above) ---
+        if age > 0:
+            delay_samples = int(delays_by_age[age] * sample_rate)
+            audio = apply_delay(audio, delay_samples)
 
         processed.append((audio, age))
 
