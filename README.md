@@ -101,6 +101,25 @@ python3 calibrate.py
 
 This records room noise, a soft phrase, and a loud phrase, then suggests values for `noise_floor_rms`, `intimate_rms`, and `strong_rms`.
 
+## Preview the Chorus (no mirror needed)
+
+Simulates one visitor triggering the mirror several times and writes what the
+amp would receive (exciter EQ, master gain and limiter applied) to
+`chorus_preview/visit.wav`. Prints which voices each response used, which
+repeat, and how hard the limiter worked. Never modifies `state.json`.
+
+```bash
+# Alone on a laptop: 12 stand-in visitors pitch-shifted from your own takes
+python3 scripts/preview_chorus.py --virtual 12 --ab
+
+# Real gallery visitors: copy the Jetson's install, then point --root at it
+rsync -av utku@jetson:~/projects/collectiveEcho/collectiveEcho/{state.json,audio} ~/jetson-snapshot/
+python3 scripts/preview_chorus.py --root ~/jetson-snapshot --ab
+```
+
+`--ab` also writes `visit_old_timing.wav` (same voices, old layer start times).
+`--hour 22` applies the night mood; `--spacing 8` simulates faster re-triggers.
+
 ## Add Fallback Recordings
 
 Place `.wav` files in `audio/fallback/i_love_you/`:

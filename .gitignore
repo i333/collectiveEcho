@@ -13,6 +13,9 @@ env/
 logs/*.log
 *.log
 
+# scripts/preview_chorus.py output
+chorus_preview/
+
 # Runtime state — regenerates / decays per machine
 state.json
 mood_state.json
